@@ -1,0 +1,14 @@
+[project]
+name = "dns-whalebone-check"
+version = "1.0.0"
+description = "Ferramenta multiplataforma para validação de bloqueio DNS (Whalebone/NOS) com captura de evidências."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "dnspython>=2.6.1",
+    "Pillow>=10.3.0",
+    "cryptography>=42.0.0",
+]
+
+[project.scripts]
+dns-check = "dns_whalebone_check:main"

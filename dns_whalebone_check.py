@@ -1563,6 +1563,43 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_output_dir(requested_dir: Optional[str], timestamp: str) -> Path:
+    default_folder_name = f"test_results_{timestamp}"
+
+    if is_android_termux():
+        public_candidates = [
+            Path("/storage/emulated/0/Download"),
+            Path("/sdcard/Download"),
+        ]
+        home_dl = Path.home() / "storage" / "downloads"
+        if home_dl.is_symlink():
+            public_candidates.insert(0, home_dl)
+
+        public_dl: Optional[Path] = None
+        for cand in public_candidates:
+            try:
+                if cand.exists() and os.access(str(cand), os.W_OK):
+                    public_dl = cand
+                    break
+            except Exception:
+                continue
+
+        if requested_dir:
+            req_path = Path(requested_dir).expanduser()
+            req_str = str(req_path)
+            if "/home/storage/downloads" in req_str and not home_dl.is_symlink() and public_dl is not None:
+                sub = req_str.split("/home/storage/downloads", 1)[1].lstrip("/")
+                return public_dl / (sub or default_folder_name)
+            return req_path
+
+        if public_dl is not None:
+            return public_dl / default_folder_name
+
+    if requested_dir:
+        return Path(requested_dir).expanduser()
+    return Path(f"./{default_folder_name}")
+
+
 def main() -> int:
     args = parse_args()
 
@@ -1583,7 +1620,7 @@ def main() -> int:
     urls = args.urls if args.urls else DEFAULT_URLS
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(args.output_dir) if args.output_dir else Path(f"./test_results_{timestamp}")
+    output_dir = resolve_output_dir(args.output_dir, timestamp)
     tls_log_dir = output_dir / "tls_logs"
     output_dir.mkdir(parents=True, exist_ok=True)
     tls_log_dir.mkdir(parents=True, exist_ok=True)

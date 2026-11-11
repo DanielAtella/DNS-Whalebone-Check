@@ -4,7 +4,6 @@
 # dependencies = [
 #     "dnspython>=2.6.1",
 #     "Pillow>=10.3.0",
-#     "cryptography>=42.0.0",
 # ]
 # ///
 """
@@ -18,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import hashlib
 import http.client
 import json
 import os
@@ -41,9 +41,6 @@ import dns.name
 import dns.query
 import dns.rdatatype
 import dns.resolver
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes
-from cryptography.x509.oid import NameOID
 from PIL import Image, ImageDraw, ImageFont
 
 # ==============================================================================
@@ -66,7 +63,7 @@ USE_CASES: Dict[str, Dict[str, object]] = {
     "1": {
         "name": "Use Case 1 - Whalebone / DNS Segurança (Padrão)",
         "description": "Compara DNS com filtragem Whalebone vs DNS Público (Google)",
-        "dns_servers": ["8.8.8.8"],
+        "dns_servers": ["10.36.41.114"],
     },
     "2": {
         "name": "Use Case 2 - DNS Secundário / Alternativo",
@@ -126,6 +123,14 @@ class HTTPResult:
     ssl_status: str = "OK"
     redirect_url: str = ""
     body_preview: str = ""
+    final_body: str = ""
+    extra_host_ips: Dict[str, str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.extra_host_ips is None:
+            self.extra_host_ips = {}
+        if not self.final_body:
+            self.final_body = self.body_preview
 
 
 # ==============================================================================
@@ -156,34 +161,53 @@ def is_android_termux() -> bool:
     )
 
 
-def load_font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Busca uma fonte legível no Windows, macOS, Linux ou Android."""
+def load_font(size: int, bold: bool = True, mono: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     candidates = []
     sys_name = platform.system().lower()
 
-    if sys_name == "darwin":
-        candidates = [
-            "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
-            "/System/Library/Fonts/Helvetica.ttc",
-            "/System/Library/Fonts/SFNSMono.ttf",
-            "/Library/Fonts/Arial.ttf",
-        ]
-    elif sys_name == "windows":
-        windir = os.environ.get("WINDIR", "C:\\Windows")
-        candidates = [
-            os.path.join(windir, "Fonts", "arialbd.ttf" if bold else "arial.ttf"),
-            os.path.join(windir, "Fonts", "seguisb.ttf" if bold else "segoeui.ttf"),
-            os.path.join(windir, "Fonts", "consolab.ttf" if bold else "consola.ttf"),
-        ]
+    if mono:
+        if sys_name == "darwin":
+            candidates = [
+                "/System/Library/Fonts/SFNSMono.ttf",
+                "/System/Library/Fonts/Menlo.ttc",
+                "/System/Library/Fonts/Supplemental/Courier New Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Courier New.ttf",
+            ]
+        elif sys_name == "windows":
+            windir = os.environ.get("WINDIR", "C:\\Windows")
+            candidates = [
+                os.path.join(windir, "Fonts", "consolab.ttf" if bold else "consola.ttf"),
+                os.path.join(windir, "Fonts", "courbd.ttf" if bold else "cour.ttf"),
+            ]
+        else:
+            candidates = [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSansMono-Bold.ttf",
+                "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
+                "/system/fonts/DroidSansMono.ttf",
+                "/system/fonts/Roboto-Bold.ttf" if bold else "/system/fonts/Roboto-Regular.ttf",
+            ]
     else:
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
-            "/system/fonts/Roboto-Bold.ttf" if bold else "/system/fonts/Roboto-Regular.ttf",
-            "/system/fonts/DroidSans-Bold.ttf",
-            "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-        ]
+        if sys_name == "darwin":
+            candidates = [
+                "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/System/Library/Fonts/Helvetica.ttc",
+                "/Library/Fonts/Arial.ttf",
+            ]
+        elif sys_name == "windows":
+            windir = os.environ.get("WINDIR", "C:\\Windows")
+            candidates = [
+                os.path.join(windir, "Fonts", "seguisb.ttf" if bold else "segoeui.ttf"),
+                os.path.join(windir, "Fonts", "arialbd.ttf" if bold else "arial.ttf"),
+            ]
+        else:
+            candidates = [
+                "/system/fonts/Roboto-Bold.ttf" if bold else "/system/fonts/Roboto-Regular.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+                "/system/fonts/DroidSans-Bold.ttf",
+                "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            ]
 
     for path in candidates:
         if os.path.isfile(path):
@@ -255,12 +279,77 @@ def resolve_dns(domain: str, dns_server: str, timeout: int = DNS_TIMEOUT) -> DNS
 # ==============================================================================
 
 
-def _extract_cn(subject: x509.Name) -> str:
-    attrs = subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-    if attrs:
-        val = attrs[0].value
-        return val if isinstance(val, str) else val.decode("utf-8", errors="replace")
-    return "N/A"
+def _extract_cert_info(der_cert: bytes) -> Tuple[str, str, str]:
+    """
+    Extrai (Subject CN, Issuer CN, Data de Expiração) sem depender de bibliotecas Rust/C (`cryptography`).
+    1. Tenta decodificar via `_ssl._test_decode_cert` nativo da stdlib do Python.
+    2. Caso indisponível, usa `openssl x509` se presente no sistema.
+    3. Caso indisponível, faz fallback via regex/ASN.1 básico sobre os bytes DER.
+    """
+    cert_cn = "N/A"
+    issuer_cn = "N/A"
+    cert_expires = "N/A"
+
+    # Método 1: Decodificador interno da biblioteca padrão `ssl` do Python
+    pem_data = ssl.DER_cert_to_PEM_cert(der_cert)
+    try:
+        decode_fn = getattr(ssl._ssl, "_test_decode_cert", None)  # type: ignore[attr-defined]
+        if decode_fn is not None:
+            with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False, encoding="utf-8") as tf:
+                tf.write(pem_data)
+                tmp_pem_path = tf.name
+            try:
+                decoded = decode_fn(tmp_pem_path)
+                if isinstance(decoded, dict):
+                    for rdn in decoded.get("subject", ()):
+                        for k, v in rdn:
+                            if k == "commonName":
+                                cert_cn = str(v)
+                    for rdn in decoded.get("issuer", ()):
+                        for k, v in rdn:
+                            if k == "commonName":
+                                issuer_cn = str(v)
+                    if decoded.get("notAfter"):
+                        cert_expires = str(decoded["notAfter"])
+            finally:
+                try:
+                    os.remove(tmp_pem_path)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+    if cert_cn != "N/A" and cert_expires != "N/A":
+        return cert_cn, issuer_cn, cert_expires
+
+    # Método 2: Fallback via binário `openssl` (disponível em Linux/macOS/Termux)
+    openssl_bin = shutil.which("openssl")
+    if openssl_bin:
+        try:
+            proc = subprocess.run(
+                [openssl_bin, "x509", "-noout", "-subject", "-issuer", "-enddate"],
+                input=pem_data,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            for line in proc.stdout.splitlines():
+                if line.startswith("subject="):
+                    m = re.search(r"CN\s*=\s*([^,/]+)", line)
+                    if m and cert_cn == "N/A":
+                        cert_cn = m.group(1).strip()
+                elif line.startswith("issuer="):
+                    m = re.search(r"CN\s*=\s*([^,/]+)", line)
+                    if m and issuer_cn == "N/A":
+                        issuer_cn = m.group(1).strip()
+                elif line.startswith("notAfter="):
+                    if cert_expires == "N/A":
+                        cert_expires = line.split("=", 1)[1].strip()
+        except Exception:
+            pass
+
+    return cert_cn, issuer_cn, cert_expires
 
 
 def _perform_single_tls_handshake(
@@ -332,16 +421,10 @@ def _perform_single_tls_handshake(
                 cert_cn = "N/A"
                 cert_expires = "N/A"
                 if der_cert:
-                    cert_obj = x509.load_der_x509_certificate(der_cert)
-                    cert_cn = _extract_cn(cert_obj.subject)
-                    issuer_cn = _extract_cn(cert_obj.issuer)
-                    try:
-                        not_after = cert_obj.not_valid_after_utc
-                    except AttributeError:
-                        not_after = cert_obj.not_valid_after
-                    cert_expires = not_after.strftime("%b %d %H:%M:%S %Y GMT")
+                    cert_cn, issuer_cn, cert_expires = _extract_cert_info(der_cert)
                     pem_data = ssl.DER_cert_to_PEM_cert(der_cert)
-                    fingerprint = cert_obj.fingerprint(hashes.SHA256()).hex(":")
+                    raw_sha256 = hashlib.sha256(der_cert).hexdigest()
+                    fingerprint = ":".join(raw_sha256[i : i + 2] for i in range(0, len(raw_sha256), 2))
 
                     log_lines.extend(
                         [
@@ -429,11 +512,11 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(raw_sock, server_hostname=server_hostname)
 
 
-def http_probe(url: str, target_ip: str, dns_server: str, timeout: int = HTTP_TIMEOUT) -> HTTPResult:
-    """
-    Faz uma requisição HTTP/HTTPS similar ao `curl -sS -k` do script original,
-    conectando no IP resolvido pelo servidor DNS em teste.
-    """
+def _single_http_request(
+    url: str,
+    target_ip: str,
+    timeout: int = HTTP_TIMEOUT,
+) -> Tuple[int, Dict[str, str], bytes]:
     parsed = urllib.parse.urlsplit(url)
     scheme = parsed.scheme.lower()
     host = parsed.hostname or ""
@@ -441,6 +524,91 @@ def http_probe(url: str, target_ip: str, dns_server: str, timeout: int = HTTP_TI
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
+
+    headers = {
+        "Host": host if (port in (80, 443)) else f"{host}:{port}",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "identity",
+        "Connection": "close",
+    }
+
+    if scheme == "https":
+        ctx_k = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx_k.check_hostname = False
+        ctx_k.verify_mode = ssl.CERT_NONE
+        conn: http.client.HTTPConnection = _PinnedHTTPSConnection(
+            host, target_ip, port=port, context=ctx_k, timeout=timeout
+        )
+    else:
+        conn = _PinnedHTTPConnection(host, target_ip, port=port, timeout=timeout)
+
+    conn.request("GET", path, headers=headers)
+    resp = conn.getresponse()
+    body_bytes = resp.read(262144)  # Até 256 KB para capturar HTML completo da página de bloqueio
+    resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+    status = resp.status
+    conn.close()
+    return status, resp_headers, body_bytes
+
+
+def _extract_meta_or_js_redirect(raw_html: str, base_url: str) -> str:
+    """Detecta redirecionamentos via <meta http-equiv='refresh'> ou window.location no HTML."""
+    if not raw_html:
+        return ""
+    m_meta = re.search(
+        r'<meta[^>]*http-equiv=["\']?refresh["\']?[^>]*content=["\']?\s*\d+\s*;\s*url=([^"\'>\s]+)',
+        raw_html,
+        re.IGNORECASE,
+    )
+    if m_meta:
+        return urllib.parse.urljoin(base_url, m_meta.group(1).strip("'\""))
+
+    m_js = re.search(
+        r'(?:window\.location(?:\.href|\.replace)?|location\.href)\s*(?:=|\()\s*["\'](https?://[^"\']+)["\']',
+        raw_html,
+        re.IGNORECASE,
+    )
+    if m_js:
+        return urllib.parse.urljoin(base_url, m_js.group(1).strip())
+    return ""
+
+
+def _resolve_subresource_hosts(raw_html: str, dns_server: str, extra_host_ips: Dict[str, str]) -> None:
+    """
+    Extrai domínios referenciados em <link>, <script>, <img> e <iframe src='https://...'>
+    dentro do HTML da página de bloqueio e resolve-os no DNS testado para que o navegador
+    carregue todo o CSS/JS/imagens da página de bloqueio sem travar!
+    """
+    if not raw_html:
+        return
+    hosts = set(
+        re.findall(
+            r'(?:src|href)\s*=\s*["\']https?://([a-zA-Z0-9.-]+)(?::\d+)?/',
+            raw_html,
+             flags=re.IGNORECASE,
+        )
+    )
+    for h in list(hosts)[:10]:
+        h_low = h.lower()
+        if h_low not in extra_host_ips:
+            r_dns = resolve_dns(h_low, dns_server, timeout=DNS_TIMEOUT)
+            if r_dns.ips:
+                extra_host_ips[h_low] = r_dns.ips[0]
+
+
+def http_probe(url: str, target_ip: str, dns_server: str, timeout: int = HTTP_TIMEOUT) -> HTTPResult:
+    """
+    Faz a requisição inicial (similar ao `curl -sS -k` do script original) conectando no IP
+    resolvido pelo servidor DNS em teste. Além disso, se houver redirect (301/302/307/308,
+    meta refresh ou JS redirect) para uma página de bloqueio (ex: sinkhole da NOS/Whalebone),
+    segue o redirect usando o mesmo servidor DNS para obter o HTML real da página de bloqueio
+    e mapear os IPs no browser.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if scheme == "https" else 80)
 
     if not target_ip or target_ip == "FALHA":
         return HTTPResult(
@@ -466,33 +634,13 @@ def http_probe(url: str, target_ip: str, dns_server: str, timeout: int = HTTP_TI
         except Exception:
             ssl_verify = "1"
 
+    extra_host_ips: Dict[str, str] = {host: target_ip}
     start = time.perf_counter()
     try:
-        headers = {
-            "Host": host if (port in (80, 443)) else f"{host}:{port}",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Connection": "close",
-        }
-
-        if scheme == "https":
-            ctx_k = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ctx_k.check_hostname = False
-            ctx_k.verify_mode = ssl.CERT_NONE
-            conn: http.client.HTTPConnection = _PinnedHTTPSConnection(
-                host, target_ip, port=port, context=ctx_k, timeout=timeout
-            )
-        else:
-            conn = _PinnedHTTPConnection(host, target_ip, port=port, timeout=timeout)
-
-        conn.request("GET", path, headers=headers)
-        resp = conn.getresponse()
-        body_bytes = resp.read(16384)
-        conn.close()
-
+        status, resp_headers, body_bytes = _single_http_request(url, target_ip, timeout=timeout)
         elapsed_ms = int(round((time.perf_counter() - start) * 1000))
-        status_code = str(resp.status)
-        location = resp.getheader("Location") or ""
+        status_code = str(status)
+        location = resp_headers.get("location", "")
         redirect_url = urllib.parse.urljoin(url, location) if location else ""
 
         if scheme == "http":
@@ -503,14 +651,53 @@ def http_probe(url: str, target_ip: str, dns_server: str, timeout: int = HTTP_TI
             ssl_status = "OK"
 
         body_text = body_bytes.decode("utf-8", errors="replace")
+        if not redirect_url:
+            redirect_url = _extract_meta_or_js_redirect(body_text, url)
+
+        final_body = body_text
+        final_url = url
+
+        # Se houve redirecionamento HTTP/Meta/JS (ex: para página de bloqueio), segue até 4 hops usando o mesmo DNS
+        curr_url = redirect_url
+        hops = 0
+        while curr_url and hops < 4:
+            hops += 1
+            r_parsed = urllib.parse.urlsplit(curr_url)
+            r_host = r_parsed.hostname or ""
+            if not r_host:
+                break
+            if r_host not in extra_host_ips:
+                r_dns = resolve_dns(r_host, dns_server, timeout=DNS_TIMEOUT)
+                if r_dns.ips:
+                    extra_host_ips[r_host] = r_dns.ips[0]
+            r_ip = extra_host_ips.get(r_host)
+            if not r_ip:
+                break
+            try:
+                r_status, r_headers, r_body_bytes = _single_http_request(curr_url, r_ip, timeout=timeout)
+                final_body = r_body_bytes.decode("utf-8", errors="replace")
+                final_url = curr_url
+                next_loc = r_headers.get("location", "")
+                if next_loc and r_status in (301, 302, 303, 307, 308):
+                    curr_url = urllib.parse.urljoin(curr_url, next_loc)
+                else:
+                    js_next = _extract_meta_or_js_redirect(final_body, curr_url)
+                    curr_url = js_next if js_next and js_next != curr_url else ""
+            except Exception:
+                break
+
+        _resolve_subresource_hosts(final_body, dns_server, extra_host_ips)
+
         return HTTPResult(
             status=status_code,
             time_ms=str(elapsed_ms),
-            final_url=url,
+            final_url=final_url,
             ssl_verify=ssl_verify,
             ssl_status=ssl_status,
             redirect_url=redirect_url,
             body_preview=body_text,
+            final_body=final_body,
+            extra_host_ips=extra_host_ips,
         )
     except Exception as e:
         elapsed_ms = int(round((time.perf_counter() - start) * 1000))
@@ -520,6 +707,7 @@ def http_probe(url: str, target_ip: str, dns_server: str, timeout: int = HTTP_TI
             ssl_status = f"CERT INVALIDO (codigo {ssl_verify})"
         else:
             ssl_status = "OK"
+        err_msg = f"Erro HTTP/Conexao: {type(e).__name__}: {e}"
         return HTTPResult(
             status="000",
             time_ms=str(elapsed_ms),
@@ -527,7 +715,9 @@ def http_probe(url: str, target_ip: str, dns_server: str, timeout: int = HTTP_TI
             ssl_verify=ssl_verify,
             ssl_status=ssl_status,
             redirect_url="",
-            body_preview=f"Erro HTTP/Conexao: {type(e).__name__}: {e}",
+            body_preview=err_msg,
+            final_body=err_msg,
+            extra_host_ips=extra_host_ips,
         )
 
 
@@ -570,14 +760,16 @@ def find_local_browser() -> Optional[str]:
             )
     else:
         for cmd in (
-            "google-chrome",
-            "google-chrome-stable",
             "chromium",
             "chromium-browser",
+            "google-chrome",
+            "google-chrome-stable",
             "microsoft-edge",
             "brave-browser",
+            "/data/data/com.termux/files/usr/bin/chromium",
+            "/data/data/com.termux/files/usr/bin/chromium-browser",
         ):
-            found = shutil.which(cmd)
+            found = shutil.which(cmd) if not cmd.startswith("/") else (cmd if os.path.isfile(cmd) else None)
             if found:
                 candidates.append(found)
 
@@ -587,83 +779,170 @@ def find_local_browser() -> Optional[str]:
     return None
 
 
+def is_screenshot_blank(png_path: Path) -> bool:
+    """
+    Verifica se o screenshot capturado pelo navegador está praticamente todo em branco
+    (ou de uma única cor sólida), o que acontece quando o navegador aborta o carregamento
+    antes de pintar o DOM ou durante um redirecionamento lento.
+    """
+    if not png_path.is_file() or png_path.stat().st_size == 0:
+        return True
+    try:
+        with Image.open(png_path) as im:
+            gray = im.convert("L")
+            extrema = gray.getextrema()
+            if not extrema:
+                return True
+            min_v, max_v = extrema
+            if max_v - min_v < 8:
+                return True
+            # Conta quantos pixels diferem significativamente do fundo predominante
+            hist = gray.histogram()
+            total_pixels = gray.width * gray.height
+            dominant_count = max(hist)
+            non_dominant_ratio = (total_pixels - dominant_count) / float(total_pixels)
+            # Se mais de 99.6% da imagem for exatamente da mesma cor, está em branco/vazia
+            return non_dominant_ratio < 0.004
+    except Exception:
+        return True
+
+
+def _inject_base_href(raw_html: str, base_url: str) -> str:
+    """Insere <base href='...'> no HTML para que CSS/imagens com caminhos relativos carreguem perfeitamente."""
+    if not base_url:
+        return raw_html
+    base_tag = f'<base href="{base_url}">'
+    if re.search(r"<head[^>]*>", raw_html, re.IGNORECASE):
+        return re.sub(
+            r"(<head[^>]*>)",
+            r"\1" + base_tag,
+            raw_html,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    return base_tag + raw_html
+
+
 def capture_browser_screenshot(
     browser_bin: str,
     url: str,
     domain: str,
     resolved_ips: List[str],
+    http_res: HTTPResult,
     output_png: Path,
     temp_dir: Path,
 ) -> bool:
     """
-    Usa o navegador local (Chrome/Edge/Brave) em modo headless com `--host-resolver-rules`
+    Usa o navegador local (Chrome/Edge/Brave/Chromium) em modo headless com `--host-resolver-rules`
     para forçar a resolução de DNS isolada sem tocar no DNS do sistema operacional!
+    Se a captura direta da URL ficar em branco (ex: bloqueio de redirect cross-domain ou TLS estrito),
+    tenta capturar diretamente a URL final da página de bloqueio ou renderizar o HTML baixado no próprio navegador.
     """
-    profile_dir = temp_dir / f"chrome_profile_{int(time.time() * 1000)}"
-    default_dir = profile_dir / "Default"
-    default_dir.mkdir(parents=True, exist_ok=True)
-
-    prefs = {
-        "browser": {"has_seen_welcome_page": True},
-        "https_only_mode_enabled": False,
-        "https_first_balanced_mode_enabled": False,
-        "https_first_mode_incognito_enabled": False,
-        "https_upgrades_enabled": False,
-        "dns_over_https": {"mode": "off"},
-        "profile": {"default_content_setting_values": {"insecure_content": 1}},
-    }
-    (default_dir / "Preferences").write_text(json.dumps(prefs), encoding="utf-8")
-    (profile_dir / "First Run").touch()
-
-    # Se o DNS resolveu para um IP, mapeamos o domínio diretamente para esse IP dentro do Chrome.
-    # Se falhou (NXDOMAIN), mapeamos para ~NOTFOUND para o navegador exibir a tela real de erro DNS.
+    rules: List[str] = []
     if resolved_ips:
-        target_ip = resolved_ips[0]
-        resolver_rule = f"MAP {domain} {target_ip}"
+        rules.append(f"MAP {domain} {resolved_ips[0]}")
+        for h, ip_val in (http_res.extra_host_ips or {}).items():
+            if h and ip_val and h != domain:
+                rules.append(f"MAP {h} {ip_val}")
     else:
-        resolver_rule = f"MAP {domain} ~NOTFOUND"
+        rules.append(f"MAP {domain} ~NOTFOUND")
 
-    cmd = [
-        browser_bin,
-        "--headless=new",
-        f"--user-data-dir={profile_dir}",
-        "--incognito",
-        "--no-sandbox",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-features=TranslateUI,InfobarUIPromos,HttpsFirstModeIncognito,HttpsFirstModeV2,HttpsUpgrades,HttpsFirstBalancedMode,HttpsFirstModeForTypicallySecureUsers,InsecureFormSubmissionInterstitial,HttpsUpgradesForEngagedSites,HttpsFirstModeForAdvancedProtectionUsers,DnsOverHttps",
-        "--disable-https-upgrades",
-        "--disable-infobars",
-        "--disable-dev-shm-usage",
-        "--disable-application-cache",
-        "--disable-cache",
-        f"--window-size={SCREEN_W},{SCREEN_H}",
-        "--ignore-certificate-errors",
-        "--ignore-certificate-errors-spki-list",
-        "--ignore-ssl-errors",
-        "--allow-running-insecure-content",
-        "--disable-web-security",
-        "--hide-scrollbars",
-        f"--host-resolver-rules={resolver_rule}",
-        f"--virtual-time-budget={PAGE_LOAD_WAIT * 1000}",
-        f"--screenshot={output_png}",
-        url,
-    ]
+    resolver_rule = ", ".join(rules)
 
-    try:
-        subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=PAGE_LOAD_WAIT + 15,
-            check=False,
-        )
-    except Exception:
-        pass
-    finally:
-        shutil.rmtree(profile_dir, ignore_errors=True)
+    def _run_browser_target(target_url_or_file: str, budget_ms: int) -> bool:
+        profile_dir = temp_dir / f"chrome_profile_{int(time.time() * 1000)}"
+        default_dir = profile_dir / "Default"
+        default_dir.mkdir(parents=True, exist_ok=True)
 
-    return output_png.is_file() and output_png.stat().st_size > 0
+        prefs = {
+            "browser": {"has_seen_welcome_page": True},
+            "https_only_mode_enabled": False,
+            "https_first_balanced_mode_enabled": False,
+            "https_first_mode_incognito_enabled": False,
+            "https_upgrades_enabled": False,
+            "dns_over_https": {"mode": "off"},
+            "profile": {"default_content_setting_values": {"insecure_content": 1}},
+        }
+        (default_dir / "Preferences").write_text(json.dumps(prefs), encoding="utf-8")
+        (profile_dir / "First Run").touch()
+
+        if output_png.exists():
+            try:
+                output_png.unlink()
+            except OSError:
+                pass
+
+        cmd = [
+            browser_bin,
+            "--headless=new",
+            f"--user-data-dir={profile_dir}",
+            "--incognito",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-features=TranslateUI,InfobarUIPromos,HttpsFirstModeIncognito,HttpsFirstModeV2,HttpsUpgrades,HttpsFirstBalancedMode,HttpsFirstModeForTypicallySecureUsers,InsecureFormSubmissionInterstitial,HttpsUpgradesForEngagedSites,HttpsFirstModeForAdvancedProtectionUsers,DnsOverHttps",
+            "--disable-https-upgrades",
+            "--disable-infobars",
+            "--disable-dev-shm-usage",
+            "--disable-application-cache",
+            "--disable-cache",
+            f"--window-size={SCREEN_W},{SCREEN_H}",
+            "--ignore-certificate-errors",
+            "--ignore-certificate-errors-spki-list",
+            "--ignore-ssl-errors",
+            "--allow-running-insecure-content",
+            "--disable-web-security",
+            "--hide-scrollbars",
+            f"--host-resolver-rules={resolver_rule}",
+            f"--virtual-time-budget={budget_ms}",
+            f"--screenshot={output_png}",
+            target_url_or_file,
+        ]
+
+        try:
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=(budget_ms // 1000) + 15,
+                check=False,
+            )
+        except Exception:
+            pass
+        finally:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+
+        return not is_screenshot_blank(output_png)
+
+    # Tentativa 1: Abre a URL original (ou a URL final se houve redirect conhecido para página de bloqueio)
+    primary_target = http_res.final_url if (http_res.redirect_url and http_res.final_url) else url
+    if _run_browser_target(primary_target, PAGE_LOAD_WAIT * 1000):
+        return True
+
+    # Tentativa 2: Se tentou a URL original e ficou em branco, mas há redirect_url diferente, abre direto a redirect_url
+    if primary_target != url and _run_browser_target(url, PAGE_LOAD_WAIT * 1000):
+        return True
+
+    # Tentativa 3: Se o navegador ficou em branco por falha de handshake/redirect na rede,
+    # mas o `http_probe` obteve o HTML real da página (ex: página de bloqueio), salva o HTML com <base href>
+    # e manda o próprio navegador renderizar o HTML local (mantendo todo o CSS, imagens e layout originais!)
+    html_body = http_res.final_body or http_res.body_preview or ""
+    if "<" in html_body and (">" in html_body) and len(html_body.strip()) > 40:
+        base_for_assets = http_res.final_url or http_res.redirect_url or url
+        enriched_html = _inject_base_href(html_body, base_for_assets)
+        local_html = temp_dir / f"rendered_block_page_{int(time.time() * 1000)}.html"
+        local_html.write_text(enriched_html, encoding="utf-8")
+        try:
+            if _run_browser_target(local_html.as_uri(), 5000):
+                return True
+        finally:
+            try:
+                local_html.unlink()
+            except OSError:
+                pass
+
+    return False
 
 
 def capture_adb_screenshot(url: str, output_png: Path, wait_sec: int = PAGE_LOAD_WAIT) -> bool:
@@ -733,7 +1012,107 @@ def capture_adb_screenshot(url: str, output_png: Path, wait_sec: int = PAGE_LOAD
     return False
 
 
-def render_visual_evidence_card(
+def _extract_structured_html_blocks(raw_html: str) -> Tuple[str, str, List[Tuple[str, str]]]:
+    """
+    Extrai (Título da Página, Cor de Fundo sugerida, Lista de blocos [(tipo, texto)])
+    a partir do HTML retornado pela página (ex: página de bloqueio da NOS / Whalebone)
+    para desenhar fielmente o view da página quando não há navegador gráfico.
+    """
+    if not raw_html:
+        return "Sem resposta HTML", "#ffffff", []
+
+    title = ""
+    m_title = re.search(r"<title[^>]*>(.*?)</title>", raw_html, re.IGNORECASE | re.DOTALL)
+    if m_title:
+        title = html_unescape(re.sub(r"\s+", " ", m_title.group(1)).strip())
+
+    # Tenta detectar background-color no CSS inline da página
+    bg_color = "#ffffff"
+    m_bg = re.search(r"body\s*\{[^}]*background(?:-color)?\s*:\s*(#[0-9a-fA-F]{3,6})", raw_html, re.IGNORECASE)
+    if m_bg:
+        bg_color = m_bg.group(1)
+
+    # Remove <script>, <style>, <svg>, <head> e comentários para extrair o conteúdo visual real do <body>
+    cleaned = re.sub(r"<!--.*?-->", " ", raw_html, flags=re.DOTALL)
+    cleaned = re.sub(r"<(script|style|noscript|head|svg)[^>]*>.*?</\1>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+    blocks: List[Tuple[str, str]] = []
+
+    # Extrai imagens com alt/src relevantes (ex: logo NOS / ícone de bloqueio)
+    for m_img in re.finditer(r"<img[^>]+>", cleaned, re.IGNORECASE):
+        tag = m_img.group(0)
+        alt_m = re.search(r'alt=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        src_m = re.search(r'src=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        alt_txt = alt_m.group(1).strip() if alt_m else ""
+        src_txt = src_m.group(1).strip() if src_m else ""
+        if alt_txt or (src_txt and not src_txt.startswith("data:")):
+            label = alt_txt if alt_txt else os.path.basename(urllib.parse.urlsplit(src_txt).path)
+            if label:
+                blocks.append(("badge", f"[Imagem/Logo: {label}]"))
+
+    # Substitui quebras de bloco por marcadores para preservar hierarquia visual (H1, H2, P, LI, DIV)
+    token_pattern = re.compile(
+        r"<(h1|h2|h3|p|li|button|a|div|span)[^>]*>(.*?)</\1>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    seen_texts = set()
+    for m in token_pattern.finditer(cleaned):
+        tag_name = m.group(1).lower()
+        inner = re.sub(r"<[^>]+>", " ", m.group(2))
+        inner = html_unescape(re.sub(r"\s+", " ", inner).strip())
+        if not inner or len(inner) < 2:
+            continue
+        if inner in seen_texts:
+            continue
+        seen_texts.add(inner)
+
+        if tag_name == "h1":
+            blocks.append(("h1", inner))
+        elif tag_name in ("h2", "h3"):
+            blocks.append(("h2", inner))
+        elif tag_name == "button":
+            blocks.append(("button", inner))
+        elif tag_name == "li":
+            blocks.append(("li", f"• {inner}"))
+        else:
+            blocks.append(("p", inner))
+
+    # Se o HTML não tinha tags semânticas aninhadas simples, extrai todo o texto visível por linha
+    if not blocks:
+        text_only = re.sub(r"<(br|hr|/p|/div|/h\d|/tr|/li)[^>]*>", "\n", cleaned, flags=re.IGNORECASE)
+        text_only = re.sub(r"<[^>]+>", " ", text_only)
+        for raw_ln in text_only.splitlines():
+            ln = html_unescape(re.sub(r"\s+", " ", raw_ln).strip())
+            if ln and ln not in seen_texts:
+                seen_texts.add(ln)
+                blocks.append(("p", ln))
+
+    return title or "Página Carregada", bg_color, blocks
+
+
+def html_unescape(text: str) -> str:
+    import html
+
+    return html.unescape(text)
+
+
+def _wrap_text_lines(text: str, max_chars: int) -> List[str]:
+    words = text.split()
+    if not words:
+        return []
+    lines: List[str] = []
+    curr = words[0]
+    for w in words[1:]:
+        if len(curr) + 1 + len(w) <= max_chars:
+            curr += " " + w
+        else:
+            lines.append(curr)
+            curr = w
+    lines.append(curr)
+    return lines
+
+
+def render_block_page_viewport(
     url: str,
     dns_server: str,
     dns_res: DNSResult,
@@ -741,79 +1120,198 @@ def render_visual_evidence_card(
     http_res: HTTPResult,
     output_png: Path,
 ) -> None:
-    """
-    Gera um cartão visual rico simulando a janela do navegador quando executado em ambiente
-    sem interface gráfica (ex: Android Termux direto no celular ou servidor sem browser).
-    """
-    img = Image.new("RGB", (SCREEN_W, SCREEN_H), "#1e1e24")
-    draw = ImageDraw.Draw(img)
-
-    font_title = load_font(34, bold=True)
-    font_sub = load_font(24, bold=True)
-    font_body = load_font(20, bold=False)
-
-    # Barra superior estilo navegador
-    draw.rectangle([(0, 0), (SCREEN_W, 70)], fill="#2b2b36")
-    draw.rounded_rectangle([(30, 14), (SCREEN_W - 30, 56)], radius=10, fill="#141419")
-    draw.text((50, 22), f"URL: {url}", fill="#e0e0e0", font=font_body)
-
-    # Determina status visual (Bloqueado / Permitido / Alerta)
-    is_blocked = (
-        not dns_res.ips
-        or http_res.status == "000"
-        or (tls_res.verify_code not in ("0", "N/A"))
-        or (http_res.ssl_verify != "0")
-        or ("whalebone" in http_res.body_preview.lower())
-        or ("block" in http_res.body_preview.lower())
-        or ("bloquead" in http_res.body_preview.lower())
+    target_w = 1104
+    html_content = http_res.final_body or http_res.body_preview or ""
+    page_title, page_bg, blocks = _extract_structured_html_blocks(html_content)
+    display_url = http_res.final_url or http_res.redirect_url or url
+    has_real_html = (
+        "<html" in html_content.lower()
+        or "<body" in html_content.lower()
+        or "<div" in html_content.lower()
+        or "<h1" in html_content.lower()
+        or "<p" in html_content.lower()
     )
 
-    status_label = "ACESSO BLOQUEADO / INTERCEPTADO PELO DNS" if is_blocked else "ACESSO PERMITIDO (CONEXÃO NORMAL)"
-    status_color = "#d9383a" if is_blocked else "#1f9d55"
+    font_h1 = load_font(28, bold=True)
+    font_h2 = load_font(20, bold=True)
+    font_body = load_font(16, bold=False)
+    font_bold = load_font(16, bold=True)
+    font_small = load_font(14, bold=False)
 
-    draw.rounded_rectangle([(80, 120), (SCREEN_W - 80, 220)], radius=12, fill=status_color)
-    draw.text((120, 150), status_label, fill="#ffffff", font=font_title)
+    est_h = 120
+    if has_real_html and blocks:
+        for btype, btext in blocks:
+            if btype == "badge":
+                est_h += 46
+            elif btype == "h1":
+                est_h += len(_wrap_text_lines(btext, 58)) * 38 + 12
+            elif btype == "h2":
+                est_h += len(_wrap_text_lines(btext, 72)) * 28 + 8
+            elif btype == "button":
+                est_h += 54
+            elif btype == "li":
+                est_h += len(_wrap_text_lines(btext, 90)) * 24 + 4
+            else:
+                est_h += len(_wrap_text_lines(btext, 92)) * 24 + 8
+        est_h = max(360, min(est_h + 60, 900))
+    else:
+        est_h = 420
 
-    # Caixa de detalhes técnicos
-    draw.rounded_rectangle([(80, 260), (SCREEN_W - 80, SCREEN_H - 80)], radius=12, fill="#262630", outline="#3e3e4f", width=2)
+    try:
+        img = Image.new("RGB", (target_w, est_h), page_bg)
+    except Exception:
+        img = Image.new("RGB", (target_w, est_h), "#ffffff")
+    draw = ImageDraw.Draw(img)
 
-    # Extrai título HTML se existir no body_preview
-    html_title = "Sem título HTML"
-    m = re.search(r"<title[^>]*>(.*?)</title>", http_res.body_preview, re.IGNORECASE | re.DOTALL)
-    if m:
-        html_title = re.sub(r"\s+", " ", m.group(1)).strip()[:100]
+    is_https_bad = tls_res.verify_code not in ("0", "N/A") or http_res.ssl_verify != "0"
 
-    details = [
-        f"Ambiente de Execução : {platform.system()} ({platform.machine()})" + (" [Android/Termux]" if is_android_termux() else ""),
-        f"Servidor DNS Testado : {dns_server}",
-        f"IP(s) Resolvido(s)   : {dns_res.ips_str} (Tempo: {dns_res.query_ms} ms)",
-        f"Handshake TLS        : {tls_res.version} | Cipher: {tls_res.cipher}",
-        f"Validação Certificado: Código {tls_res.verify_code} ({tls_res.verify_text}) | CN: {tls_res.cert_cn}",
-        f"Validade Certificado : {tls_res.cert_expires}",
-        f"Status HTTP          : {http_res.status} (Tempo: {http_res.time_ms} ms) | SSL: {http_res.ssl_status}",
-        f"Redirecionamento     : {http_res.redirect_url or 'Nenhum'}",
-        f"Título da Página     : {html_title}",
-        "",
-        "Trecho da Resposta / Detalhe:",
-    ]
+    if has_real_html and blocks:
+        is_block_page = (
+            "bloquead" in html_content.lower()
+            or "whalebone" in html_content.lower()
+            or "seguranca" in display_url.lower()
+            or "segurança" in html_content.lower()
+            or "proteg" in html_content.lower()
+            or "acesso" in html_content.lower()
+            or "malware" in html_content.lower()
+            or "phishing" in html_content.lower()
+        )
+        top_bar_color = "#dc3535" if is_block_page else "#1a73e8"
+        draw.rectangle([(0, 0), (target_w, 10)], fill=top_bar_color)
 
-    y = 300
-    for line in details:
-        draw.text((120, y), line, fill="#f0f0f5", font=font_sub if " : " in line else font_body)
-        y += 45
+        y_cursor = 32
+        x_pad = 40
+        if page_title:
+            draw.text((x_pad, y_cursor), page_title, fill="#5f6368", font=font_small)
+            y_cursor += 28
+            draw.line([(x_pad, y_cursor), (target_w - x_pad, y_cursor)], fill="#e0e0e0", width=1)
+            y_cursor += 20
 
-    # Preview limpo do corpo ou erro
-    clean_preview = re.sub(r"<[^>]+>", " ", http_res.body_preview)
-    clean_preview = re.sub(r"\s+", " ", clean_preview).strip()
-    if not clean_preview:
-        clean_preview = "(Sem conteúdo textual no corpo da resposta)"
+        for btype, btext in blocks:
+            if y_cursor > est_h - 48:
+                break
+            if btype == "badge":
+                bw = min(x_pad + len(btext) * 9 + 24, target_w - x_pad)
+                draw.rounded_rectangle(
+                    [(x_pad, y_cursor), (bw, y_cursor + 32)],
+                    radius=4,
+                    fill="#f8f9fa",
+                    outline="#dadce0",
+                )
+                draw.text((x_pad + 12, y_cursor + 6), btext, fill="#3c4043", font=font_small)
+                y_cursor += 44
+            elif btype == "h1":
+                for ln in _wrap_text_lines(btext, 58):
+                    draw.text((x_pad, y_cursor), ln, fill="#c5221f" if is_block_page else "#202124", font=font_h1)
+                    y_cursor += 38
+                y_cursor += 10
+            elif btype == "h2":
+                for ln in _wrap_text_lines(btext, 72):
+                    draw.text((x_pad, y_cursor), ln, fill="#202124", font=font_h2)
+                    y_cursor += 28
+                y_cursor += 8
+            elif btype == "button":
+                btn_w = min(max(len(btext) * 11 + 32, 160), 420)
+                draw.rounded_rectangle(
+                    [(x_pad, y_cursor), (x_pad + btn_w, y_cursor + 40)],
+                    radius=6,
+                    fill=top_bar_color,
+                )
+                draw.text((x_pad + 18, y_cursor + 10), btext[:38], fill="#ffffff", font=font_bold)
+                y_cursor += 52
+            elif btype == "li":
+                for ln in _wrap_text_lines(btext, 90):
+                    draw.text((x_pad + 16, y_cursor), ln, fill="#3c4043", font=font_body)
+                    y_cursor += 24
+                y_cursor += 4
+            else:
+                for ln in _wrap_text_lines(btext, 92):
+                    draw.text((x_pad, y_cursor), ln, fill="#3c4043", font=font_body)
+                    y_cursor += 24
+                y_cursor += 8
+    else:
+        draw.rectangle([(0, 0), (target_w, est_h)], fill="#ffffff")
+        draw.rectangle([(0, 0), (target_w, 10)], fill="#dc3535")
+        box_x, box_y = 60, 50
+        draw.rounded_rectangle([(box_x, box_y), (box_x + 56, box_y + 56)], radius=10, fill="#fce8e6")
+        draw.text((box_x + 20, box_y + 10), "!", fill="#d93025", font=font_h1)
 
-    # Quebra em linhas de até 110 caracteres
-    for i in range(0, min(len(clean_preview), 660), 110):
-        draw.text((120, y), clean_preview[i : i + 110], fill="#a5a5b8", font=font_body)
-        y += 32
+        y_cursor = box_y + 80
+        if not dns_res.ips:
+            err_title = "Não é possível acessar esse site"
+            err_sub = f"Não foi possível encontrar o endereço IP do servidor de {url}"
+            err_code = "DNS_PROBE_FINISHED_NXDOMAIN"
+        elif is_https_bad:
+            err_title = "Sua conexão não é particular / Site Bloqueado"
+            err_sub = (
+                f"O servidor DNS ({dns_server}) redirecionou {url} para o IP de bloqueio ({dns_res.ips_str}), "
+                f"cujo certificado pertence a '{tls_res.cert_cn}'."
+            )
+            err_code = f"NET::ERR_CERT_COMMON_NAME_INVALID (CN={tls_res.cert_cn} | Verify={tls_res.verify_code})"
+        else:
+            err_title = "A conexão com o site foi recusada ou encerrada"
+            err_sub = f"O IP resolvido ({dns_res.ips_str}) encerrou a conexão para {url}."
+            err_code = f"HTTP Status: {http_res.status}"
+
+        draw.text((box_x, y_cursor), err_title, fill="#202124", font=font_h1)
+        y_cursor += 48
+        for ln in _wrap_text_lines(err_sub, 82):
+            draw.text((box_x, y_cursor), ln, fill="#5f6368", font=font_body)
+            y_cursor += 26
+        y_cursor += 18
+        draw.text((box_x, y_cursor), err_code, fill="#d93025", font=font_bold)
 
     img.save(output_png, "PNG")
+
+
+def _load_embedded_screenshot(
+    temp_shot: Path,
+    url: str,
+    dns_server: str,
+    dns_res: DNSResult,
+    tls_res: TLSResult,
+    http_res: HTTPResult,
+) -> Image.Image:
+    env_b64 = os.environ.get("BLOCK_SCREENSHOT_BASE64", "").strip()
+    env_path = os.environ.get("BLOCK_SCREENSHOT_PATH", "").strip()
+
+    if env_b64:
+        try:
+            import base64
+            import io
+
+            raw_bytes = base64.b64decode(env_b64)
+            with Image.open(io.BytesIO(raw_bytes)) as im:
+                return im.convert("RGB")
+        except Exception:
+            pass
+
+    if env_path and os.path.isfile(env_path):
+        try:
+            with Image.open(env_path) as im:
+                return im.convert("RGB")
+        except Exception:
+            pass
+
+    if not temp_shot.is_file() or temp_shot.stat().st_size == 0:
+        render_block_page_viewport(url, dns_server, dns_res, tls_res, http_res, temp_shot)
+
+    with Image.open(temp_shot) as im:
+        return im.convert("RGB")
+
+
+def _apply_rounded_border(im: Image.Image, radius: int, border_color: str) -> Image.Image:
+    w, h = im.size
+    mask = Image.new("L", (w, h), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle([(0, 0), (w - 1, h - 1)], radius=radius, fill=255)
+
+    bg = Image.new("RGB", (w, h), "#22222c")
+    bg.paste(im, (0, 0), mask)
+
+    border_draw = ImageDraw.Draw(bg)
+    border_draw.rounded_rectangle([(0, 0), (w - 1, h - 1)], radius=radius, outline=border_color, width=1)
+    return bg
 
 
 def build_final_screenshot_with_banner(
@@ -826,51 +1324,165 @@ def build_final_screenshot_with_banner(
     tls_res: TLSResult,
     http_res: HTTPResult,
 ) -> None:
-    """
-    Cria o banner superior idêntico ao ImageMagick (`convert`) do script Bash original
-    e concatena verticalmente com a captura de tela.
-    """
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line1 = f"URL: {url}"
-    line2 = f"DNS: {dns_server}  |  Resolveu: {dns_res.ips_str}  |  Query: {dns_res.query_ms} ms"
-    line3 = f"TLS: {tls_res.version}  |  Cipher: {tls_res.cipher}  |  Verify: {tls_res.verify_code} ({tls_res.verify_text})"
-    line4 = f"HTTP: {http_res.status}  |  Tempo: {http_res.time_ms} ms  |  SSL(probe): {http_res.ssl_status}"
-    if http_res.redirect_url:
-        line5 = f"Redirect: {http_res.redirect_url}  |  {now_str}"
-    else:
-        line5 = f"Final: {http_res.final_url}  |  {now_str}"
+    container_w = 1200
 
-    tls_bad = scheme == "https" and tls_res.verify_code not in ("0", "N/A")
-    ssl_bad = scheme == "https" and http_res.ssl_verify != "0"
+    resolved_ip = dns_res.ips_str
+    dns_time_ms = dns_res.query_ms
+    tls_version = tls_res.version
+    cipher_suite = tls_res.cipher
+    ssl_verify_code = tls_res.verify_code
+    ssl_verify_msg = tls_res.verify_text
+    cert_cn = tls_res.cert_cn
+    cert_expiry = tls_res.cert_expires
+    http_status = http_res.status
+    http_time_ms = http_res.time_ms
+    ssl_probe_summary = http_res.ssl_status
+    redirect_url = http_res.redirect_url or "Nenhum"
 
-    if tls_bad or ssl_bad:
-        banner_color = "#960000"  # Vermelho (bloqueado / certificado inválido)
-    elif http_res.status.startswith("2"):
-        banner_color = "#0a6e0a"  # Verde (HTTP 2xx + SSL OK)
-    elif http_res.status.startswith("3"):
-        banner_color = "#b48c00"  # Amarelo (Redirect 3xx)
-    else:
-        banner_color = "#960000"  # Vermelho (Erro / Bloqueio)
+    os_env = f"{platform.system()} ({platform.machine()})"
+    if is_android_termux():
+        os_env += " [Android/Termux]"
 
-    with Image.open(temp_shot) as shot_im:
-        shot_rgb = shot_im.convert("RGB")
-        w = shot_rgb.width
-        h = shot_rgb.height
+    html_content = http_res.final_body or http_res.body_preview or ""
+    page_title = "Sem título HTML"
+    m_title = re.search(r"<title[^>]*>(.*?)</title>", html_content, re.IGNORECASE | re.DOTALL)
+    if m_title:
+        extracted_title = html_unescape(re.sub(r"\s+", " ", m_title.group(1)).strip())
+        if extracted_title:
+            page_title = extracted_title[:100]
 
-        banner_im = Image.new("RGB", (w, BANNER_H), banner_color)
-        draw = ImageDraw.Draw(banner_im)
-        font = load_font(20, bold=True)
+    shot_img = _load_embedded_screenshot(temp_shot, url, dns_server, dns_res, tls_res, http_res)
 
-        lines = [line1, line2, line3, line4, line5]
-        y_pos = 10
-        for ln in lines:
-            draw.text((20, y_pos), ln, fill="white", font=font)
-            y_pos += 28
+    card_margin_x = 32
+    card_padding = 24
+    inner_w = container_w - (card_margin_x * 2) - (card_padding * 2)
 
-        combined = Image.new("RGB", (w, BANNER_H + h))
-        combined.paste(banner_im, (0, 0))
-        combined.paste(shot_rgb, (0, BANNER_H))
-        combined.save(final_shot, "PNG")
+    scale = inner_w / float(shot_img.width)
+    target_shot_w = inner_w
+    target_shot_h = max(1, int(round(shot_img.height * scale)))
+    resized_shot = shot_img.resize((target_shot_w, target_shot_h), Image.Resampling.LANCZOS)
+    bordered_shot = _apply_rounded_border(resized_shot, radius=4, border_color="#3d3d4e")
+
+    font_header_mono = load_font(12, bold=True, mono=True)
+    font_url_bar = load_font(12, bold=False, mono=False)
+    font_alert = load_font(16, bold=True, mono=False)
+    font_prop_key = load_font(13, bold=False, mono=False)
+    font_prop_val = load_font(13, bold=True, mono=False)
+    font_secondary = load_font(11, bold=False, mono=False)
+    font_shot_label = load_font(12, bold=False, mono=False)
+
+    header_line_h = 17
+    header_pad_y = 8
+    header_pad_x = 12
+    header_h = (header_pad_y * 2) + (header_line_h * 5)
+
+    addr_bar_pad_y = 8
+    addr_bar_pad_x = 16
+    addr_input_h = 26
+    addr_bar_h = (addr_bar_pad_y * 2) + addr_input_h
+
+    section_gap = 20
+    alert_h = 46
+
+    prop_row_h = 26
+    sec_row_h = 22
+    props_total_h = (8 * prop_row_h) + sec_row_h
+
+    shot_section_margin_top = 20
+    shot_label_h = 16
+    shot_label_margin_bottom = 10
+
+    card_h = (
+        (card_padding * 2)
+        + props_total_h
+        + shot_section_margin_top
+        + shot_label_h
+        + shot_label_margin_bottom
+        + target_shot_h
+    )
+
+    bottom_margin = 32
+    total_h = header_h + addr_bar_h + section_gap + alert_h + section_gap + card_h + bottom_margin
+
+    canvas = Image.new("RGB", (container_w, total_h), "#181820")
+    draw = ImageDraw.Draw(canvas)
+
+    draw.rectangle([(0, 0), (container_w, header_h)], fill="#8b0000")
+    header_lines = [
+        f"URL: {url}",
+        f"DNS: {dns_server} | Resolveu: {resolved_ip} | Query: {dns_time_ms} ms",
+        f"TLS: {tls_version} | Cipher: {cipher_suite} | Verify: {ssl_verify_code} ({ssl_verify_msg})",
+        f"HTTP: {http_status} | Tempo: {http_time_ms} ms | SSL(probe): {ssl_probe_summary}",
+        f"Redirect: {redirect_url}",
+    ]
+    hy = header_pad_y
+    for hline in header_lines:
+        draw.text((header_pad_x, hy), hline, fill="#ffffff", font=font_header_mono)
+        hy += header_line_h
+
+    addr_y1 = header_h
+    addr_y2 = addr_y1 + addr_bar_h
+    draw.rectangle([(0, addr_y1), (container_w, addr_y2)], fill="#23232e")
+    input_x1 = addr_bar_pad_x
+    input_y1 = addr_y1 + addr_bar_pad_y
+    input_x2 = container_w - addr_bar_pad_x
+    input_y2 = input_y1 + addr_input_h
+    draw.rounded_rectangle([(input_x1, input_y1), (input_x2, input_y2)], radius=4, fill="#121217")
+    draw.text((input_x1 + 12, input_y1 + 6), f"URL: {url}", fill="#a0a0ab", font=font_url_bar)
+
+    alert_x1 = card_margin_x
+    alert_x2 = container_w - card_margin_x
+    alert_y1 = addr_y2 + section_gap
+    alert_y2 = alert_y1 + alert_h
+    draw.rounded_rectangle([(alert_x1, alert_y1), (alert_x2, alert_y2)], radius=6, fill="#dc3535")
+    alert_text = "ACESSO BLOQUEADO / INTERCEPTADO PELO DNS"
+    draw.text((alert_x1 + 20, alert_y1 + 14), alert_text, fill="#ffffff", font=font_alert)
+
+    card_x1 = card_margin_x
+    card_x2 = container_w - card_margin_x
+    card_y1 = alert_y2 + section_gap
+    card_y2 = card_y1 + card_h
+    draw.rounded_rectangle(
+        [(card_x1, card_y1), (card_x2, card_y2)],
+        radius=6,
+        fill="#22222c",
+        outline="#343442",
+        width=1,
+    )
+
+    px = card_x1 + card_padding
+    py = card_y1 + card_padding
+    colon_x = px + 168
+    val_x = colon_x + 14
+
+    rows = [
+        ("primary", "Ambiente de Execução", os_env),
+        ("primary", "Servidor DNS Testado", dns_server),
+        ("primary", "IP(s) Resolvido(s)", f"{resolved_ip} (Tempo: {dns_time_ms} ms)"),
+        ("primary", "Handshake TLS", f"{tls_version} | Cipher: {cipher_suite}"),
+        ("secondary", "", f"Validação Certificado: Código {ssl_verify_code} ({ssl_verify_msg}) | CN: {cert_cn}"),
+        ("primary", "Validade Certificado", cert_expiry),
+        ("primary", "Status HTTP", f"{http_status} (Tempo: {http_time_ms} ms) | SSL: {ssl_probe_summary}"),
+        ("primary", "Redirecionamento", redirect_url),
+        ("primary", "Título da Página", page_title),
+    ]
+
+    for rtype, k_label, v_label in rows:
+        if rtype == "secondary":
+            draw.text((px, py), v_label, fill="#b0b0bc", font=font_secondary)
+            py += sec_row_h
+        else:
+            draw.text((px, py), k_label, fill="#e2e2e9", font=font_prop_key)
+            draw.text((colon_x, py), ":", fill="#e2e2e9", font=font_prop_key)
+            draw.text((val_x, py), v_label, fill="#e2e2e9", font=font_prop_val)
+            py += prop_row_h
+
+    py += shot_section_margin_top
+    draw.text((px, py), "Trecho da Resposta / Detalhe:", fill="#b0b0bc", font=font_shot_label)
+    py += shot_label_h + shot_label_margin_bottom
+
+    canvas.paste(bordered_shot, (px, py))
+    canvas.save(final_shot, "PNG")
 
 
 # ==============================================================================
@@ -1079,14 +1691,20 @@ def main() -> int:
 
                     if not captured and args.mode in ("auto", "desktop") and browser_bin:
                         captured = capture_browser_screenshot(
-                            browser_bin, url, domain, dns_res.ips, temp_shot, temp_dir
+                            browser_bin,
+                            url,
+                            domain,
+                            dns_res.ips,
+                            http_res,
+                            temp_shot,
+                            temp_dir,
                         )
                         if captured:
-                            logger.log("  Screenshot: capturado via navegador com DNS isolado")
+                            logger.log("  Screenshot: capturado via navegador real com DNS isolado")
 
                     if not captured:
-                        logger.log("  Screenshot: gerando cartão visual de evidência (modo sem navegador/Termux)")
-                        render_visual_evidence_card(url, dns_srv, dns_res, tls_res, http_res, temp_shot)
+                        logger.log("  Screenshot: renderizando view da página para embutir no card")
+                        render_block_page_viewport(url, dns_srv, dns_res, tls_res, http_res, temp_shot)
 
                     build_final_screenshot_with_banner(
                         temp_shot=temp_shot,

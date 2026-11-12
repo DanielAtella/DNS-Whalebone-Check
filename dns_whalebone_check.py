@@ -17,20 +17,26 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import getpass
 import hashlib
 import http.client
 import json
+import math
 import os
 import platform
 import re
+import selectors
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.parse
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -63,17 +69,17 @@ USE_CASES: Dict[str, Dict[str, object]] = {
     "1": {
         "name": "Use Case 1 - Whalebone / DNS Segurança (Padrão)",
         "description": "Compara DNS com filtragem Whalebone vs DNS Público (Google)",
-        "dns_servers": ["10.36.41.114"],
+        "dns_servers": ["10.36.41.114", "8.8.8.8"],
     },
     "2": {
-        "name": "Use Case 2 - DNS Secundário / Alternativo",
+        "name": "Use Case 2 - Whalebone / DNS Segurança",
         "description": "Validação de servidores DNS do Use Case 2",
-        "dns_servers": ["9.9.9.9"],
+        "dns_servers": ["10.36.41.115", "8.8.8.8"],
     },
     "3": {
-        "name": "Use Case 3 - DNS Customizado / Homologação",
+        "name": "Use Case 3 - Whalebone / DNS Segurança",
         "description": "Validação de servidores DNS do Use Case 3",
-        "dns_servers": ["1.1.1.1"],
+        "dns_servers": ["10.36.41.116", "8.8.8.8"],
     },
 }
 
@@ -131,6 +137,187 @@ class HTTPResult:
             self.extra_host_ips = {}
         if not self.final_body:
             self.final_body = self.body_preview
+
+
+@dataclass
+class ExportConfig:
+    archive_format: str = "none"  # "none", "tar", "zip"
+    scp_enabled: bool = False
+    scp_host: str = ""
+    scp_port: int = 22
+    scp_user: str = ""
+    scp_password: str = ""
+    scp_remote_path: str = "~/"
+
+
+@dataclass
+class EnvConfig:
+    env_file_path: Optional[Path] = None
+    dns_servers: List[str] = None  # type: ignore[assignment]
+    domains: List[str] = None  # type: ignore[assignment]
+    archive_format: Optional[str] = None  # "none", "tar", "zip"
+    scp_enabled: Optional[bool] = None
+    scp_host: str = ""
+    scp_port: int = 22
+    scp_user: str = ""
+    scp_password: str = ""
+    scp_remote_path: str = "~/"
+    auto_run: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dns_servers is None:
+            self.dns_servers = []
+        if self.domains is None:
+            self.domains = []
+
+
+def _normalize_domain_or_url(item: str) -> str:
+    val = item.strip()
+    if not val:
+        return ""
+    if not re.match(r"^https?://", val, re.IGNORECASE):
+        return f"https://{val}"
+    return val
+
+
+def _parse_bool_env(val: str) -> Optional[bool]:
+    v = val.strip().lower()
+    if not v:
+        return None
+    if v in ("1", "true", "yes", "y", "sim", "s", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "nao", "não", "off"):
+        return False
+    return None
+
+
+def load_env_config(custom_env_path: Optional[str] = None) -> EnvConfig:
+    """
+    Lê configurações de um arquivo `.env` (sem dependências externas), suportando:
+    - DNS_SERVERS: lista de servidores DNS (separados por vírgula, ponto-e-vírgula ou espaço)
+    - DOMAINS / TEST_URLS: lista de domínios ou URLs a serem testados
+    - ARCHIVE_FORMAT: none, tar ou zip
+    - SCP_ENABLED: true ou false (transferir ao terminar via SCP)
+    - SCP_HOST / SCP_IP: IP ou hostname do servidor remoto de destino
+    - SCP_PORT: porta SSH/SCP (padrão 22)
+    - SCP_USER: usuário do servidor de destino
+    - SCP_PATH / SCP_REMOTE_PATH: diretório remoto de destino (padrão ~/)
+    - SCP_PASSWORD: senha opcional (se omitida, será solicitada de forma oculta via getpass)
+    - AUTO_RUN: true ou false (se true, inicia os testes direto com os dados do .env sem parar nos menus)
+    """
+    candidates: List[Path] = []
+    if custom_env_path:
+        candidates.append(Path(custom_env_path).expanduser())
+    else:
+        candidates.append(Path.cwd() / ".env")
+        script_dir_env = Path(__file__).resolve().parent / ".env"
+        if script_dir_env not in candidates:
+            candidates.append(script_dir_env)
+
+    env_path: Optional[Path] = None
+    for cand in candidates:
+        if cand.is_file():
+            env_path = cand
+            break
+
+    if env_path is None:
+        return EnvConfig()
+
+    raw_vars: Dict[str, str] = {}
+    try:
+        content = env_path.read_text(encoding="utf-8", errors="replace")
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("export "):
+                line = line[7:].strip()
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip().upper()
+            val = val.strip()
+            if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+                val = val[1:-1]
+            else:
+                # Remove comentários inline (ex: VALOR # comentário)
+                val = re.sub(r"\s+#.*$", "", val).strip()
+            raw_vars[key] = val
+    except Exception:
+        return EnvConfig()
+
+    cfg = EnvConfig(env_file_path=env_path)
+
+    # 1. Lista de DNS utilizados
+    raw_dns = raw_vars.get("DNS_SERVERS") or raw_vars.get("DNS_LIST") or raw_vars.get("DNS") or ""
+    if raw_dns:
+        cfg.dns_servers = [s.strip() for s in re.split(r"[,;\s]+", raw_dns) if s.strip()]
+
+    # Permite também customizar os Use Cases 1, 2 e 3 via .env caso desejado
+    for uc_num in ("1", "2", "3"):
+        uc_dns_raw = raw_vars.get(f"USE_CASE_{uc_num}_DNS", "")
+        if uc_dns_raw and uc_num in USE_CASES:
+            uc_ips = [s.strip() for s in re.split(r"[,;\s]+", uc_dns_raw) if s.strip()]
+            if uc_ips:
+                USE_CASES[uc_num]["dns_servers"] = uc_ips
+
+    # 2. Lista de Domínios / URLs a serem testados
+    raw_domains = (
+        raw_vars.get("DOMAINS")
+        or raw_vars.get("TEST_URLS")
+        or raw_vars.get("URLS")
+        or raw_vars.get("DOMAIN_LIST")
+        or ""
+    )
+    if raw_domains:
+        parsed_urls: List[str] = []
+        for item in re.split(r"[,;\s]+", raw_domains):
+            norm = _normalize_domain_or_url(item)
+            if norm:
+                parsed_urls.append(norm)
+        if parsed_urls:
+            cfg.domains = parsed_urls
+
+    # 3. Formato de arquivamento (tar, zip, none)
+    raw_arch = (raw_vars.get("ARCHIVE_FORMAT") or raw_vars.get("ARCHIVE") or "").strip().lower()
+    if raw_arch in ("tar", "tar.gz", "tgz"):
+        cfg.archive_format = "tar"
+    elif raw_arch == "zip":
+        cfg.archive_format = "zip"
+    elif raw_arch in ("none", "false", "0", "nao", "não"):
+        cfg.archive_format = "none"
+
+    # 4. Transferência via SCP ao terminar + IP e User do servidor de destino
+    raw_scp_en = (
+        raw_vars.get("SCP_ENABLED")
+        or raw_vars.get("SCP_TRANSFER")
+        or raw_vars.get("TRANSFER_SCP")
+        or ""
+    )
+    cfg.scp_enabled = _parse_bool_env(raw_scp_en)
+    cfg.scp_host = (
+        raw_vars.get("SCP_HOST")
+        or raw_vars.get("SCP_IP")
+        or raw_vars.get("SCP_SERVER")
+        or ""
+    ).strip()
+    cfg.scp_user = (raw_vars.get("SCP_USER") or raw_vars.get("SCP_USERNAME") or "").strip()
+    cfg.scp_password = raw_vars.get("SCP_PASSWORD") or ""
+    cfg.scp_remote_path = (
+        raw_vars.get("SCP_PATH")
+        or raw_vars.get("SCP_REMOTE_PATH")
+        or "~/"
+    ).strip() or "~/"
+
+    raw_port = (raw_vars.get("SCP_PORT") or "22").strip()
+    if raw_port.isdigit() and 1 <= int(raw_port) <= 65535:
+        cfg.scp_port = int(raw_port)
+
+    auto_run_val = _parse_bool_env(raw_vars.get("AUTO_RUN", ""))
+    if auto_run_val is not None:
+        cfg.auto_run = auto_run_val
+
+    return cfg
 
 
 # ==============================================================================
@@ -670,12 +857,28 @@ def http_probe(url: str, target_ip: str, dns_server: str, timeout: int = HTTP_TI
                 r_dns = resolve_dns(r_host, dns_server, timeout=DNS_TIMEOUT)
                 if r_dns.ips:
                     extra_host_ips[r_host] = r_dns.ips[0]
-            r_ip = extra_host_ips.get(r_host)
+                    # Re-envia consulta DNS do domínio original para que o sinkhole Whalebone mantenha
+                    # a correlação de ameaça ativa para este cliente após resolver o host de redirect:
+                    resolve_dns(host, dns_server, timeout=DNS_TIMEOUT)
+                else:
+                    extra_host_ips[r_host] = target_ip
+            r_ip = extra_host_ips.get(r_host) or target_ip
             if not r_ip:
                 break
             try:
                 r_status, r_headers, r_body_bytes = _single_http_request(curr_url, r_ip, timeout=timeout)
-                final_body = r_body_bytes.decode("utf-8", errors="replace")
+                # O cluster sinkhole da Whalebone (/passthrough) pode retornar Content-Length: 0 na primeira
+                # tentativa enquanto o evento de auditoria DNS propaga entre os nós ECMP (~200-500ms).
+                # Fazemos retry com nova consulta DNS ao domínio bloqueado até receber o HTML completo:
+                retry_count = 0
+                while len(r_body_bytes) < 64 and retry_count < 6:
+                    retry_count += 1
+                    time.sleep(0.25)
+                    resolve_dns(host, dns_server, timeout=DNS_TIMEOUT)
+                    r_status, r_headers, r_body_bytes = _single_http_request(curr_url, r_ip, timeout=timeout)
+
+                if r_body_bytes:
+                    final_body = r_body_bytes.decode("utf-8", errors="replace")
                 final_url = curr_url
                 next_loc = r_headers.get("location", "")
                 if next_loc and r_status in (301, 302, 303, 307, 308):
@@ -866,69 +1069,95 @@ def capture_browser_screenshot(
         (default_dir / "Preferences").write_text(json.dumps(prefs), encoding="utf-8")
         (profile_dir / "First Run").touch()
 
-        if output_png.exists():
+        for headless_flag in ("--headless=new", "--headless"):
+            if output_png.exists():
+                try:
+                    output_png.unlink()
+                except OSError:
+                    pass
+
+            cmd = [
+                browser_bin,
+                headless_flag,
+                f"--user-data-dir={profile_dir}",
+                "--incognito",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-features=TranslateUI,InfobarUIPromos,HttpsFirstModeIncognito,HttpsFirstModeV2,HttpsUpgrades,HttpsFirstBalancedMode,HttpsFirstModeForTypicallySecureUsers,InsecureFormSubmissionInterstitial,HttpsUpgradesForEngagedSites,HttpsFirstModeForAdvancedProtectionUsers,DnsOverHttps",
+                "--disable-https-upgrades",
+                "--disable-infobars",
+                "--disable-dev-shm-usage",
+                "--disable-application-cache",
+                "--disable-cache",
+                f"--window-size={SCREEN_W},{SCREEN_H}",
+                "--ignore-certificate-errors",
+                "--ignore-certificate-errors-spki-list",
+                "--ignore-ssl-errors",
+                "--allow-running-insecure-content",
+                "--disable-web-security",
+                "--hide-scrollbars",
+                f"--host-resolver-rules={resolver_rule}",
+                f"--virtual-time-budget={budget_ms}",
+                f"--screenshot={output_png}",
+                target_url_or_file,
+            ]
+
             try:
-                output_png.unlink()
+                subprocess.run(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=(budget_ms // 1000) + 15,
+                    check=False,
+                )
+            except Exception:
+                pass
+
+            if not is_screenshot_blank(output_png):
+                shutil.rmtree(profile_dir, ignore_errors=True)
+                return True
+
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        return not is_screenshot_blank(output_png)
+
+    html_body = http_res.final_body or http_res.body_preview or ""
+    has_captured_block_html = (
+        bool(http_res.redirect_url)
+        and len(html_body.strip()) > 200
+        and ("<html" in html_body.lower() or "<main" in html_body.lower())
+    )
+
+    # Tentativa 1: Se houve redirect para página de bloqueio (ex: Whalebone /passthrough) e o `http_probe`
+    # já capturou o HTML real completo da página de bloqueio, renderiza diretamente no navegador local com
+    # <base href> e --host-resolver-rules para evitar que o token temporário do /passthrough retorne 0 bytes:
+    if has_captured_block_html:
+        base_for_assets = http_res.final_url or http_res.redirect_url or url
+        enriched_html = _inject_base_href(html_body, base_for_assets)
+        local_html = temp_dir / f"rendered_block_page_{int(time.time() * 1000)}.html"
+        local_html.write_text(enriched_html, encoding="utf-8")
+        try:
+            if _run_browser_target(local_html.as_uri(), 4000):
+                return True
+        finally:
+            try:
+                local_html.unlink()
             except OSError:
                 pass
 
-        cmd = [
-            browser_bin,
-            "--headless=new",
-            f"--user-data-dir={profile_dir}",
-            "--incognito",
-            "--no-sandbox",
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-features=TranslateUI,InfobarUIPromos,HttpsFirstModeIncognito,HttpsFirstModeV2,HttpsUpgrades,HttpsFirstBalancedMode,HttpsFirstModeForTypicallySecureUsers,InsecureFormSubmissionInterstitial,HttpsUpgradesForEngagedSites,HttpsFirstModeForAdvancedProtectionUsers,DnsOverHttps",
-            "--disable-https-upgrades",
-            "--disable-infobars",
-            "--disable-dev-shm-usage",
-            "--disable-application-cache",
-            "--disable-cache",
-            f"--window-size={SCREEN_W},{SCREEN_H}",
-            "--ignore-certificate-errors",
-            "--ignore-certificate-errors-spki-list",
-            "--ignore-ssl-errors",
-            "--allow-running-insecure-content",
-            "--disable-web-security",
-            "--hide-scrollbars",
-            f"--host-resolver-rules={resolver_rule}",
-            f"--virtual-time-budget={budget_ms}",
-            f"--screenshot={output_png}",
-            target_url_or_file,
-        ]
-
-        try:
-            subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=(budget_ms // 1000) + 15,
-                check=False,
-            )
-        except Exception:
-            pass
-        finally:
-            shutil.rmtree(profile_dir, ignore_errors=True)
-
-        return not is_screenshot_blank(output_png)
-
-    # Tentativa 1: Abre a URL original (ou a URL final se houve redirect conhecido para página de bloqueio)
+    # Tentativa 2: Abre a URL original (ou a URL final se houve redirect) diretamente pela rede isolada
     primary_target = http_res.final_url if (http_res.redirect_url and http_res.final_url) else url
     if _run_browser_target(primary_target, PAGE_LOAD_WAIT * 1000):
         return True
 
-    # Tentativa 2: Se tentou a URL original e ficou em branco, mas há redirect_url diferente, abre direto a redirect_url
+    # Tentativa 3: Se tentou a URL final e ficou em branco, tenta abrir a URL original
     if primary_target != url and _run_browser_target(url, PAGE_LOAD_WAIT * 1000):
         return True
 
-    # Tentativa 3: Se o navegador ficou em branco por falha de handshake/redirect na rede,
-    # mas o `http_probe` obteve o HTML real da página (ex: página de bloqueio), salva o HTML com <base href>
-    # e manda o próprio navegador renderizar o HTML local (mantendo todo o CSS, imagens e layout originais!)
-    html_body = http_res.final_body or http_res.body_preview or ""
-    if "<" in html_body and (">" in html_body) and len(html_body.strip()) > 40:
+    # Tentativa 4: Fallback renderizando qualquer HTML capturado pelo http_probe no navegador
+    if not has_captured_block_html and "<" in html_body and (">" in html_body) and len(html_body.strip()) > 40:
         base_for_assets = http_res.final_url or http_res.redirect_url or url
         enriched_html = _inject_base_href(html_body, base_for_assets)
         local_html = temp_dir / f"rendered_block_page_{int(time.time() * 1000)}.html"
@@ -1112,6 +1341,278 @@ def _wrap_text_lines(text: str, max_chars: int) -> List[str]:
     return lines
 
 
+def _extract_whalebone_block_page_data(raw_html: str, url: str = "", redirect_url: str = "") -> Optional[Dict[str, str]]:
+    """
+    Detecta se o HTML retornado (ou o redirect para redirect.nos-security.pt) corresponde à página de bloqueio
+    da NOS / Whalebone e extrai todos os textos reais e a categoria da ameaça (como o JS da página faz).
+    """
+    low_html = (raw_html or "").lower()
+    low_redir = (redirect_url or "").lower()
+    is_wb_nos = (
+        "detected_threats_text" in low_html
+        or "nos - ligação não segura" in low_html
+        or "wb-hide-on-loading" in low_html
+        or "redirect.nos-security.pt" in low_redir
+    )
+    if not is_wb_nos:
+        return None
+
+    def _clean_tag_text(pattern: str, default: str) -> str:
+        m = re.search(pattern, raw_html, re.IGNORECASE | re.DOTALL)
+        if not m:
+            return default
+        txt = re.sub(r"<[^>]+>", " ", m.group(1))
+        txt = html_unescape(re.sub(r"\s+", " ", txt).strip())
+        return txt or default
+
+    heading = _clean_tag_text(r'<h1[^>]*class=["\'][^"\']*title[^"\']*["\'][^>]*>(.*?)</h1>', "A ligação não é segura")
+
+    desc_text = "Tentou aceder a um site que a NOS considera perigoso."
+    m_desc = re.search(r'<p[^>]*class=["\'][^"\']*description[^"\']*["\'][^>]*>(.*?)(?:<br|<b>|</p>)', raw_html, re.IGNORECASE | re.DOTALL)
+    if m_desc:
+        cand = html_unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m_desc.group(1))).strip())
+        if cand:
+            desc_text = cand
+
+    # Extrai a categoria da ameaça exatamente como a função JS `showDetectedThreats()` da página faz
+    trans_pt = {
+        "MALWARE": "Malware",
+        "C_AND_C": "Botnets",
+        "PHISHING": "Phishing",
+        "SPAM": "Sites de Spam",
+        "COMPROMISED": "Comprometido",
+        "COINMINER": "Criptomineração",
+        "BLACKLIST": "Malware",
+    }
+    # Atualiza com eventuais traduções customizadas presentes no HTML
+    for m_tr in re.finditer(r"['\"]([A-Z_]+)['\"]\s*:\s*['\"]([^'\"]+)['\"]", raw_html):
+        k_tr, v_tr = m_tr.group(1), m_tr.group(2)
+        if k_tr in trans_pt:
+            trans_pt[k_tr] = v_tr
+
+    raw_cat = ""
+    for m_cat in re.finditer(r'normalizeCategory\(\s*["\']([^"\']*)["\']\s*\)', raw_html):
+        if m_cat.group(1).strip():
+            raw_cat = m_cat.group(1).strip()
+            break
+
+    if not raw_cat:
+        u_low = url.lower()
+        if "phishing" in u_low:
+            raw_cat = "PHISHING"
+        elif "c2server" in u_low or "botnet" in u_low:
+            raw_cat = "C_AND_C"
+        elif "spam" in u_low:
+            raw_cat = "SPAM"
+        elif "coinminer" in u_low or "miner" in u_low:
+            raw_cat = "COINMINER"
+        else:
+            raw_cat = "MALWARE"
+
+    norm_cat = raw_cat.upper().replace("-", "_")
+    detected_list: List[str] = []
+    for k_key, k_label in trans_pt.items():
+        if k_key in norm_cat and k_label not in detected_list:
+            detected_list.append(k_label)
+    if not detected_list:
+        detected_list.append(trans_pt["MALWARE"])
+    threat_val = ", ".join(detected_list)
+
+    threat_prefix = "Ameaças detetadas:"
+    m_b = re.search(r"<b>\s*([^<]+?)\s*<span[^>]*id=[\"']detected_threats_text[\"']", raw_html, re.IGNORECASE)
+    if m_b:
+        p_cand = html_unescape(re.sub(r"\s+", " ", m_b.group(1)).strip())
+        if p_cand:
+            threat_prefix = p_cand
+
+    contact_trigger = _clean_tag_text(
+        r'<p[^>]*id=["\']contact_details_button["\'][^>]*>(.*?)</p>',
+        "Ver contactos de suporte",
+    )
+    btn_back = _clean_tag_text(
+        r'<button[^>]*id=["\']back_button["\'][^>]*>(.*?)</button>',
+        "Sair da página",
+    )
+    btn_bypass = _clean_tag_text(
+        r'<a[^>]*id=["\']bypass_button["\'][^>]*>(.*?)</a>',
+        "Continuar mesmo assim",
+    )
+    footer_text = _clean_tag_text(
+        r'<span[^>]*class=["\'][^"\']*footer-text[^"\']*["\'][^>]*>(.*?)</span>',
+        "Saiba mais sobre a segurança digital da NOS:",
+    )
+
+    return {
+        "heading": heading,
+        "description": desc_text,
+        "threat_line": f"{threat_prefix} {threat_val}",
+        "contact_trigger": contact_trigger,
+        "btn_back": btn_back,
+        "btn_bypass": btn_bypass,
+        "footer_text": footer_text,
+        "footer_link_1": "Particulares",
+        "footer_link_2": "Empresas",
+    }
+
+
+def _render_nos_whalebone_block_page(wb_data: Dict[str, str], output_png: Path) -> None:
+    """
+    Renderiza fielmente a tela de bloqueio da NOS / Whalebone (layout oficial completo com fundo #dddee3,
+    card branco centralizado com sombra, logotipo NOS, escudo vermelho, textos centralizados, botões e rodapé).
+    Garante que no Linux (sem browser gráfico) e no Android (Termux) a evidência mostre exatamente a página de bloqueio.
+    """
+    canvas_w, canvas_h = SCREEN_W, SCREEN_H
+    canvas = Image.new("RGB", (canvas_w, canvas_h), "#dddee3")
+    draw = ImageDraw.Draw(canvas)
+
+    card_w, card_h = 1104, 680
+    card_x1 = (canvas_w - card_w) // 2
+    card_y1 = (canvas_h - card_h) // 2
+    card_x2 = card_x1 + card_w
+    card_y2 = card_y1 + card_h
+
+    # Sombra suave do card
+    for offset, shade in ((12, "#cfd0d6"), (8, "#c7c8ce"), (4, "#bec0c6")):
+        draw.rounded_rectangle(
+            [(card_x1 + offset // 2, card_y1 + offset), (card_x2 + offset // 2, card_y2 + offset)],
+            radius=18,
+            fill=shade,
+        )
+
+    # Card branco principal
+    draw.rounded_rectangle([(card_x1, card_y1), (card_x2, card_y2)], radius=16, fill="#ffffff")
+
+    # 1. Logotipo NOS no canto superior esquerdo do card
+    logo_x = card_x1 + 48
+    logo_y = card_y1 + 48
+    font_logo = load_font(30, bold=True)
+    draw.text((logo_x, logo_y + 6), "N", fill="#000000", font=font_logo)
+    ox, oy = logo_x + 45, logo_y + 24
+    for deg in range(0, 360, 15):
+        rad = math.radians(deg)
+        x_in = ox + math.cos(rad) * 11
+        y_in = oy + math.sin(rad) * 11
+        x_out = ox + math.cos(rad) * 20
+        y_out = oy + math.sin(rad) * 20
+        draw.line([(x_in, y_in), (x_out, y_out)], fill="#000000", width=2)
+    draw.text((logo_x + 70, logo_y + 6), "S", fill="#000000", font=font_logo)
+
+    # 2. Círculo vermelho central (#e04232) com ícone de escudo branco
+    cx = canvas_w // 2
+    icon_cy = card_y1 + 172
+    icon_r = 52
+    draw.ellipse(
+        [(cx - icon_r, icon_cy - icon_r), (cx + icon_r, icon_cy + icon_r)],
+        fill="#e04232",
+    )
+    # Desenho vetorial do escudo branco no centro do círculo
+    shield_outer = [
+        (cx, icon_cy - 25),
+        (cx + 21, icon_cy - 18),
+        (cx + 18, icon_cy + 6),
+        (cx, icon_cy + 25),
+        (cx - 18, icon_cy + 6),
+        (cx - 21, icon_cy - 18),
+    ]
+    shield_inner = [
+        (cx, icon_cy - 19),
+        (cx + 15, icon_cy - 13),
+        (cx + 13, icon_cy + 4),
+        (cx, icon_cy + 19),
+        (cx - 13, icon_cy + 4),
+        (cx - 15, icon_cy - 13),
+    ]
+    draw.polygon(shield_outer, fill="#ffffff")
+    draw.polygon(shield_inner, fill="#e04232")
+
+    # 3. Textos centralizados da página de bloqueio
+    font_title = load_font(34, bold=True)
+    font_desc = load_font(17, bold=False)
+    font_threat = load_font(17, bold=True)
+    font_link = load_font(14, bold=True)
+    font_btn = load_font(15, bold=True)
+    font_footer = load_font(14, bold=False)
+
+    def _draw_centered(y_pos: int, text: str, font_obj: ImageFont.FreeTypeFont | ImageFont.ImageFont, color: str, underline: bool = False) -> int:
+        bbox = draw.textbbox((0, 0), text, font=font_obj)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        tx = cx - (tw // 2)
+        draw.text((tx, y_pos), text, fill=color, font=font_obj)
+        if underline:
+            uy = y_pos + th + 4
+            draw.line([(tx, uy), (tx + tw, uy)], fill=color, width=1)
+        return th
+
+    y_cur = icon_cy + icon_r + 32
+    _draw_centered(y_cur, wb_data["heading"], font_title, "#000000")
+    y_cur += 54
+    _draw_centered(y_cur, wb_data["description"], font_desc, "#202124")
+    y_cur += 44
+    _draw_centered(y_cur, wb_data["threat_line"], font_threat, "#000000")
+    y_cur += 36
+    _draw_centered(y_cur, wb_data["contact_trigger"], font_link, "#000000", underline=True)
+
+    # 4. Dois botões estilo pílula lado a lado ("Sair da página" e "Continuar mesmo assim")
+    btn_y1 = y_cur + 68
+    btn_w = 240
+    btn_h = 48
+    btn_gap = 16
+
+    b1_x1 = cx - btn_w - (btn_gap // 2)
+    b1_x2 = b1_x1 + btn_w
+    draw.rounded_rectangle(
+        [(b1_x1, btn_y1), (b1_x2, btn_y1 + btn_h)],
+        radius=24,
+        fill="#ffffff",
+        outline="#202124",
+        width=1,
+    )
+    b1_box = draw.textbbox((0, 0), wb_data["btn_back"], font=font_btn)
+    b1_tw = b1_box[2] - b1_box[0]
+    draw.text((b1_x1 + (btn_w - b1_tw) // 2, btn_y1 + 14), wb_data["btn_back"], fill="#000000", font=font_btn)
+
+    b2_x1 = cx + (btn_gap // 2)
+    b2_x2 = b2_x1 + btn_w
+    draw.rounded_rectangle(
+        [(b2_x1, btn_y1), (b2_x2, btn_y1 + btn_h)],
+        radius=24,
+        fill="#e04232",
+    )
+    b2_box = draw.textbbox((0, 0), wb_data["btn_bypass"], font=font_btn)
+    b2_tw = b2_box[2] - b2_box[0]
+    draw.text((b2_x1 + (btn_w - b2_tw) // 2, btn_y1 + 14), wb_data["btn_bypass"], fill="#ffffff", font=font_btn)
+
+    # 5. Rodapé com linha divisória
+    div_y = card_y2 - 74
+    draw.line([(card_x1 + 48, div_y), (card_x2 - 48, div_y)], fill="#e5e7eb", width=1)
+
+    fy = div_y + 24
+    fx = card_x1 + 48
+    ft_text = wb_data["footer_text"]
+    draw.text((fx, fy), ft_text, fill="#202124", font=font_footer)
+    ft_box = draw.textbbox((0, 0), ft_text, font=font_footer)
+    fx += (ft_box[2] - ft_box[0]) + 10
+
+    l1 = wb_data["footer_link_1"]
+    draw.text((fx, fy), l1, fill="#000000", font=font_footer)
+    l1_box = draw.textbbox((0, 0), l1, font=font_footer)
+    l1_w = l1_box[2] - l1_box[0]
+    draw.line([(fx, fy + 18), (fx + l1_w, fy + 18)], fill="#000000", width=1)
+    fx += l1_w + 8
+
+    draw.text((fx, fy), "|", fill="#202124", font=font_footer)
+    fx += 14
+
+    l2 = wb_data["footer_link_2"]
+    draw.text((fx, fy), l2, fill="#000000", font=font_footer)
+    l2_box = draw.textbbox((0, 0), l2, font=font_footer)
+    l2_w = l2_box[2] - l2_box[0]
+    draw.line([(fx, fy + 18), (fx + l2_w, fy + 18)], fill="#000000", width=1)
+
+    canvas.save(output_png, "PNG")
+
+
 def render_block_page_viewport(
     url: str,
     dns_server: str,
@@ -1120,8 +1621,13 @@ def render_block_page_viewport(
     http_res: HTTPResult,
     output_png: Path,
 ) -> None:
-    target_w = 1104
     html_content = http_res.final_body or http_res.body_preview or ""
+    wb_data = _extract_whalebone_block_page_data(html_content, url=url, redirect_url=http_res.redirect_url)
+    if wb_data is not None:
+        _render_nos_whalebone_block_page(wb_data, output_png)
+        return
+
+    target_w = 1104
     page_title, page_bg, blocks = _extract_structured_html_blocks(html_content)
     display_url = http_res.final_url or http_res.redirect_url or url
     has_real_html = (
@@ -1486,26 +1992,537 @@ def build_final_screenshot_with_banner(
 
 
 # ==============================================================================
-# SELEÇÃO DE USE CASE / ENTRADA DO USUÁRIO
+# ARQUIVAMENTO (TAR / ZIP) E ENVIO SEGURO VIA SCP
 # ==============================================================================
 
 
-def select_dns_servers_interactive() -> Tuple[str, List[str]]:
-    """Exibe menu interativo para escolha entre os 3 Use Cases ou digitação manual dos IPs."""
+def _log_or_print(logger: Optional[Logger], msg: str) -> None:
+    if logger is not None:
+        logger.log(msg)
+    else:
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] {msg}", flush=True)
+
+
+def create_results_archive(
+    output_dir: Path,
+    archive_format: str,
+    logger: Optional[Logger] = None,
+) -> Optional[Path]:
+    """
+    Compacta o diretório de resultados em formato TAR (.tar.gz) ou ZIP (.zip).
+    Retorna o caminho do arquivo gerado ou None em caso de erro/formato 'none'.
+    """
+    fmt = archive_format.lower().strip()
+    if fmt in ("none", "", "nao", "não"):
+        return None
+
+    output_dir = output_dir.resolve()
+    if not output_dir.exists() or not output_dir.is_dir():
+        _log_or_print(logger, f"ERRO: Diretório de resultados não encontrado para arquivamento: {output_dir}")
+        return None
+
+    try:
+        if fmt in ("tar", "tar.gz", "tgz"):
+            archive_path = output_dir.parent / f"{output_dir.name}.tar.gz"
+            _log_or_print(logger, f"Compactando resultados em TAR.GZ: {archive_path.name} ...")
+            with tarfile.open(archive_path, "w:gz") as tar:
+                tar.add(output_dir, arcname=output_dir.name)
+        elif fmt == "zip":
+            archive_path = output_dir.parent / f"{output_dir.name}.zip"
+            _log_or_print(logger, f"Compactando resultados em ZIP: {archive_path.name} ...")
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for item in sorted(output_dir.rglob("*")):
+                    if item.is_file():
+                        arcname = item.relative_to(output_dir.parent)
+                        zf.write(item, arcname=str(arcname))
+        else:
+            _log_or_print(logger, f"ERRO: Formato de arquivo desconhecido: {archive_format}")
+            return None
+
+        size_kb = archive_path.stat().st_size / 1024.0
+        _log_or_print(logger, f"Arquivo gerado com sucesso: {archive_path} ({size_kb:.1f} KB)")
+        return archive_path
+    except Exception as e:
+        _log_or_print(logger, f"ERRO ao criar arquivo compactado ({fmt}): {type(e).__name__}: {e}")
+        return None
+
+
+def _run_scp_with_pty(cmd: List[str], password: str, timeout: int = 120) -> Tuple[int, str]:
+    """
+    Executa `scp` em sistemas POSIX (Linux, macOS, Android/Termux) dentro de um pseudo-terminal (pty)
+    com terminal controlador (`TIOCSCTTY`) devidamente configurado para `/dev/tty`, injetando a senha
+    de forma segura quando o prompt do OpenSSH a solicita.
+    """
+    import fcntl
+    import pty
+    import termios
+
+    master_fd, slave_fd = pty.openpty()
+
+    def _setup_ctty() -> None:
+        os.setsid()
+        try:
+            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+        except OSError:
+            pass
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+        preexec_fn=_setup_ctty,
+    )
+    os.close(slave_fd)
+
+    sel = selectors.DefaultSelector()
+    sel.register(master_fd, selectors.EVENT_READ)
+
+    output_chunks: List[str] = []
+    recent_buffer = ""
+    password_sent_count = 0
+    hostkey_sent = False
+    start_time = time.monotonic()
+
+    try:
+        while True:
+            if time.monotonic() - start_time > timeout:
+                proc.kill()
+                return 124, "Timeout ao transferir arquivo via SCP."
+
+            events = sel.select(timeout=0.25)
+            if events:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+
+                text = data.decode("utf-8", errors="replace")
+                output_chunks.append(text)
+                recent_buffer = (recent_buffer + text)[-512:]
+                low_buf = recent_buffer.lower()
+
+                if (
+                    "are you sure you want to continue connecting" in low_buf
+                    or "(yes/no" in low_buf
+                ) and not hostkey_sent:
+                    os.write(master_fd, b"yes\n")
+                    hostkey_sent = True
+                    recent_buffer = ""
+                elif ("password:" in low_buf or "passphrase" in low_buf) and password:
+                    if password_sent_count == 0:
+                        os.write(master_fd, (password + "\n").encode("utf-8"))
+                        password_sent_count += 1
+                        recent_buffer = ""
+                    else:
+                        proc.terminate()
+                        return 5, "Falha de autenticação SCP: usuário ou senha incorretos (Permission denied)."
+            else:
+                if proc.poll() is not None:
+                    break
+    finally:
+        sel.close()
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    proc.wait(timeout=5)
+    combined_out = "".join(output_chunks)
+    if password:
+        combined_out = combined_out.replace(password, "***")
+    return proc.returncode or 0, combined_out.strip()
+
+
+def _run_scp_with_askpass(cmd: List[str], password: str, timeout: int = 120) -> Tuple[int, str]:
+    """
+    Executa `scp` usando `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force` (suportado em macOS, Linux, Windows e Termux).
+    A senha é passada exclusivamente por variável de ambiente de escopo restrito ao subprocesso e nunca
+    aparece na linha de comando.
+    """
+    with tempfile.TemporaryDirectory(prefix="scp_askpass_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        env = os.environ.copy()
+        env["_DNS_CHECK_SCP_SECRET"] = password
+        env["DISPLAY"] = env.get("DISPLAY") or ":0"
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+
+        if platform.system().lower() == "windows":
+            askpass_script = tmp_path / "askpass.bat"
+            askpass_script.write_text(
+                '@echo off\r\n"%s" -c "import os, sys; arg = \' \'.join(sys.argv[1:]).lower(); '
+                'print(\'yes\' if \'yes/no\' in arg else os.environ.get(\'_DNS_CHECK_SCP_SECRET\', \'\'))"\r\n'
+                % sys.executable,
+                encoding="utf-8",
+            )
+        else:
+            askpass_script = tmp_path / "askpass.sh"
+            askpass_script.write_text(
+                '#!/bin/sh\n'
+                'case "$*" in\n'
+                '  *yes/no*|*fingerprint*) printf "yes\\n" ;;\n'
+                '  *) printf "%s\\n" "$_DNS_CHECK_SCP_SECRET" ;;\n'
+                'esac\n',
+                encoding="utf-8",
+            )
+            os.chmod(askpass_script, stat.S_IRWXU)
+
+        env["SSH_ASKPASS"] = str(askpass_script)
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=timeout,
+                start_new_session=True,
+                check=False,
+            )
+            out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            if password:
+                out = out.replace(password, "***")
+            return proc.returncode, out
+        except subprocess.TimeoutExpired:
+            return 124, "Timeout ao transferir arquivo via SCP."
+        except Exception as e:
+            return 1, f"{type(e).__name__}: {e}"
+
+
+def send_via_scp(
+    local_target: Path,
+    export_cfg: ExportConfig,
+    logger: Optional[Logger] = None,
+) -> bool:
+    """
+    Envia o arquivo compactado (ou diretório de resultados) para o servidor remoto via SCP
+    utilizando autenticação segura (sem expor a senha na linha de comando nem nos logs).
+    """
+    if not export_cfg.scp_enabled:
+        return True
+
+    scp_bin = shutil.which("scp")
+    if not scp_bin:
+        _log_or_print(
+            logger,
+            "ERRO SCP: Cliente 'scp' (OpenSSH) não encontrado no sistema. Instale o OpenSSH Client e tente novamente.",
+        )
+        return False
+
+    local_target = local_target.resolve()
+    if not local_target.exists():
+        _log_or_print(logger, f"ERRO SCP: Arquivo/diretório local não encontrado: {local_target}")
+        return False
+
+    remote_path = export_cfg.scp_remote_path.strip() or "~/"
+    remote_target = f"{export_cfg.scp_user}@{export_cfg.scp_host}:{remote_path}"
+
+    _log_or_print(
+        logger,
+        f"Enviando '{local_target.name}' via SCP para {export_cfg.scp_user}@{export_cfg.scp_host}:{remote_path} (porta {export_cfg.scp_port})...",
+    )
+
+    cmd: List[str] = [
+        scp_bin,
+        "-P",
+        str(export_cfg.scp_port),
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+    ]
+    if export_cfg.scp_password:
+        cmd.extend(
+            [
+                "-o",
+                "PreferredAuthentications=keyboard-interactive,password",
+                "-o",
+                "PubkeyAuthentication=no",
+            ]
+        )
+    if local_target.is_dir():
+        cmd.append("-r")
+    cmd.extend([str(local_target), remote_target])
+
+    # Tenta primeiro via SSH_ASKPASS isolado (compatível com macOS, Linux, Windows e OpenSSH moderno).
+    # Caso falhe por ausência de suporte a SSH_ASKPASS em sistemas POSIX antigos, faz fallback para PTY com TIOCSCTTY.
+    rc, details = _run_scp_with_askpass(cmd, export_cfg.scp_password)
+    if rc != 0 and os.name == "posix" and "permission denied" not in details.lower():
+        try:
+            rc_pty, details_pty = _run_scp_with_pty(cmd, export_cfg.scp_password)
+            if rc_pty == 0 or details_pty:
+                rc, details = rc_pty, details_pty
+        except Exception:
+            pass
+
+    if rc == 0:
+        _log_or_print(
+            logger,
+            f"SCP concluído com sucesso! Arquivo enviado para {export_cfg.scp_user}@{export_cfg.scp_host}:{remote_path}",
+        )
+        return True
+
+    # Limpa linhas de prompt de senha do output antes de registrar o erro
+    clean_lines = [
+        ln.strip()
+        for ln in details.splitlines()
+        if ln.strip() and "password:" not in ln.lower()
+    ]
+    err_summary = " | ".join(clean_lines[-3:]) if clean_lines else f"código de saída {rc}"
+    _log_or_print(logger, f"ERRO no envio SCP (código {rc}): {err_summary}")
+    return False
+
+
+# ==============================================================================
+# SELEÇÃO DE USE CASE / ENTRADA DO USUÁRIO (MENU INICIAL)
+# ==============================================================================
+
+
+def _prompt_password_secure(prompt_text: str) -> str:
+    """
+    Solicita a senha do usuário de forma segura (sem ecoar caracteres no terminal).
+    """
+    try:
+        return getpass.getpass(prompt_text)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+    except Exception:
+        # Fallback caso o ambiente não possua tty compatível com getpass
+        return input(prompt_text)
+
+
+def configure_export_options_interactive(
+    require_action: bool = False,
+    env_cfg: Optional[EnvConfig] = None,
+) -> ExportConfig:
+    """
+    Pergunta ao usuário no menu inicial se deseja arquivar o resultado (TAR ou ZIP)
+    e se deseja enviá-lo para um servidor remoto via SCP com usuário e senha seguros.
+    Se houver configurações pré-definidas no arquivo `.env`, utiliza-as como padrão.
+    """
+    env_cfg = env_cfg or EnvConfig()
+    print("\n" + "-" * 68)
+    print("   OPÇÕES DE ARQUIVAMENTO (TAR / ZIP) E ENVIO REMOTO (SCP)")
+    print("-" * 68)
+
+    has_env_export = (
+        env_cfg.archive_format is not None
+        or env_cfg.scp_enabled is not None
+        or bool(env_cfg.scp_host)
+    )
+    if has_env_export:
+        env_arch = env_cfg.archive_format or ("tar" if require_action else "none")
+        env_scp = bool(env_cfg.scp_enabled) if env_cfg.scp_enabled is not None else bool(env_cfg.scp_host)
+        print(f"  Configuração detectada no .env:")
+        print(f"    • Arquivamento : {env_arch.upper()}")
+        if env_scp:
+            print(
+                f"    • Envio SCP    : ATIVADO ({env_cfg.scp_user or '<solicitar>'}@{env_cfg.scp_host or '<solicitar>'}:{env_cfg.scp_remote_path} porta {env_cfg.scp_port})"
+            )
+        else:
+            print("    • Envio SCP    : DESATIVADO")
+        use_env_ans = (
+            input("  Pressione ENTER para usar essas opções do .env ou digite 'e' para alterar manualmente: ")
+            .strip()
+            .lower()
+        )
+        if use_env_ans != "e":
+            if not env_scp:
+                return ExportConfig(archive_format=env_arch, scp_enabled=False)
+            scp_host = env_cfg.scp_host
+            while not scp_host or any(c in scp_host for c in (" ", ";", "&", "|", "`", "$")):
+                scp_host = input("  Servidor remoto (IP ou Hostname, ex: 192.168.1.50): ").strip()
+            scp_user = env_cfg.scp_user
+            while not scp_user or any(c in scp_user for c in (" ", ";", "&", "|", "`", "$")):
+                scp_user = input(f"  Usuário (User) para {scp_host}: ").strip()
+            scp_password = env_cfg.scp_password or _prompt_password_secure(
+                f"  Senha (Password) para {scp_user}@{scp_host} (digitação oculta): "
+            )
+            return ExportConfig(
+                archive_format=env_arch,
+                scp_enabled=True,
+                scp_host=scp_host,
+                scp_port=env_cfg.scp_port,
+                scp_user=scp_user,
+                scp_password=scp_password,
+                scp_remote_path=env_cfg.scp_remote_path,
+            )
+
+    print("  Formato de arquivamento do resultado:")
+    if not require_action:
+        default_fmt_num = {"none": "1", "tar": "2", "zip": "3"}.get(env_cfg.archive_format or "none", "1")
+        print("    [1] Não arquivar (manter apenas a pasta de resultados)")
+        print("    [2] Arquivar em TAR (.tar.gz)")
+        print("    [3] Arquivar em ZIP (.zip)")
+        fmt_choice = input(f"  Escolha uma opção [1-3] (Enter para {default_fmt_num}): ").strip() or default_fmt_num
+        fmt_map = {"1": "none", "2": "tar", "3": "zip", "tar": "tar", "zip": "zip"}
+        archive_format = fmt_map.get(fmt_choice.lower(), "none")
+    else:
+        default_fmt_num = {"tar": "1", "zip": "2", "none": "3"}.get(env_cfg.archive_format or "tar", "1")
+        print("    [1] Arquivar em TAR (.tar.gz)")
+        print("    [2] Arquivar em ZIP (.zip)")
+        print("    [3] Não compactar (enviar pasta diretamente via SCP)")
+        fmt_choice = input(f"  Escolha uma opção [1-3] (Enter para {default_fmt_num}): ").strip() or default_fmt_num
+        fmt_map = {"1": "tar", "2": "zip", "3": "none", "tar": "tar", "zip": "zip"}
+        archive_format = fmt_map.get(fmt_choice.lower(), "tar")
+
+    default_scp_str = "S/n" if env_cfg.scp_enabled else "s/N"
+    scp_ans = input(f"\n  Deseja enviar o resultado para um servidor remoto via SCP? [{default_scp_str}]: ").strip().lower()
+    if not scp_ans:
+        scp_enabled = bool(env_cfg.scp_enabled)
+    else:
+        scp_enabled = scp_ans in ("s", "sim", "y", "yes")
+
+    if not scp_enabled:
+        return ExportConfig(archive_format=archive_format, scp_enabled=False)
+
+    # Caso o usuário tenha escolhido enviar via SCP mas ainda não tinha selecionado TAR/ZIP,
+    # oferece a oportunidade de escolher se quer compactar em TAR ou ZIP antes do envio:
+    if archive_format == "none" and not require_action:
+        pack_ans = (
+            input("  Deseja compactar antes de enviar via SCP? [1=TAR (.tar.gz), 2=ZIP (.zip), 3=Enviar pasta] (Enter para 1): ")
+            .strip()
+            .lower()
+            or "1"
+        )
+        if pack_ans in ("1", "tar"):
+            archive_format = "tar"
+        elif pack_ans in ("2", "zip"):
+            archive_format = "zip"
+
+    print("\n  --- Configuração do Servidor Remoto (SCP) ---")
+    while True:
+        host_prompt = (
+            f"  Servidor remoto (Enter para {env_cfg.scp_host}): "
+            if env_cfg.scp_host
+            else "  Servidor remoto (IP ou Hostname, ex: 192.168.1.50): "
+        )
+        scp_host = input(host_prompt).strip() or env_cfg.scp_host
+        if scp_host and not any(c in scp_host for c in (" ", ";", "&", "|", "`", "$")):
+            break
+        print("  Por favor, informe um IP ou hostname válido.")
+
+    while True:
+        raw_port = input(f"  Porta SSH/SCP (Enter para {env_cfg.scp_port}): ").strip() or str(env_cfg.scp_port)
+        if raw_port.isdigit() and 1 <= int(raw_port) <= 65535:
+            scp_port = int(raw_port)
+            break
+        print("  Porta inválida. Informe um número entre 1 e 65535.")
+
+    scp_remote_path = (
+        input(f"  Caminho de destino remoto (Enter para {env_cfg.scp_remote_path}): ").strip()
+        or env_cfg.scp_remote_path
+    )
+
+    while True:
+        user_prompt = (
+            f"  Usuário (User) para {scp_host} (Enter para {env_cfg.scp_user}): "
+            if env_cfg.scp_user
+            else f"  Usuário (User) para {scp_host}: "
+        )
+        scp_user = input(user_prompt).strip() or env_cfg.scp_user
+        if scp_user and not any(c in scp_user for c in (" ", ";", "&", "|", "`", "$")):
+            break
+        print("  Por favor, informe um nome de usuário válido.")
+
+    scp_password = env_cfg.scp_password or _prompt_password_secure(
+        f"  Senha (Password) para {scp_user}@{scp_host} (digitação oculta): "
+    )
+
+    return ExportConfig(
+        archive_format=archive_format,
+        scp_enabled=True,
+        scp_host=scp_host,
+        scp_port=scp_port,
+        scp_user=scp_user,
+        scp_password=scp_password,
+        scp_remote_path=scp_remote_path,
+    )
+
+
+def _select_existing_result_dir_interactive() -> Optional[Path]:
+    """Lista diretórios `test_results_*` existentes para arquivamento/envio via SCP imediato."""
+    candidates = sorted(
+        [p for p in Path(".").glob("test_results_*") if p.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    print("\n" + "-" * 68)
+    print("   SELECIONE O DIRETÓRIO DE RESULTADOS EXISTENTE")
+    print("-" * 68)
+    if candidates:
+        for idx, cand in enumerate(candidates[:10], start=1):
+            print(f"  [{idx}] {cand.name}")
+        print(f"  [{len(candidates[:10]) + 1}] Informar outro caminho manualmente")
+        raw = input("  Escolha uma opção (Enter para 1): ").strip() or "1"
+        if raw.isdigit() and 1 <= int(raw) <= len(candidates[:10]):
+            return candidates[int(raw) - 1]
+
+    custom_path = input("  Digite o caminho do diretório de resultados: ").strip()
+    if not custom_path:
+        return None
+    p = Path(custom_path).expanduser()
+    if not p.exists() or not p.is_dir():
+        print(f"  ERRO: Diretório '{p}' não encontrado.")
+        return None
+    return p
+
+
+def select_dns_servers_interactive(
+    env_cfg: Optional[EnvConfig] = None,
+) -> Tuple[str, List[str], ExportConfig, Optional[Path]]:
+    """
+    Exibe menu inicial interativo para:
+    - Escolha entre os DNS do `.env`, os 3 Use Cases ou digitação manual dos IPs;
+    - Opção de arquivar o resultado em TAR (.tar.gz) ou ZIP (.zip);
+    - Opção de enviar o resultado para um servidor remoto via SCP com user e password seguros.
+    """
+    env_cfg = env_cfg or EnvConfig()
     print("\n" + "=" * 68)
-    print("   DNS WHALEBONE CHECK - SELEÇÃO DE USE CASE / SERVIDORES DNS")
+    print("   DNS WHALEBONE CHECK - MENU INICIAL")
     print("=" * 68)
+    if env_cfg.env_file_path:
+        print(f"  [Arquivo .env carregado: {env_cfg.env_file_path.name}]")
+        if env_cfg.domains:
+            print(f"  [Domínios do .env: {len(env_cfg.domains)} domínio(s) configurado(s)]")
+        print("-" * 68)
+
+    if env_cfg.dns_servers:
+        print("  [0] Usar Servidores DNS do arquivo .env (Padrão)")
+        print(f"      Servidores (.env): {', '.join(env_cfg.dns_servers)}\n")
+
     for key, uc in USE_CASES.items():
         servers_str = ", ".join(uc["dns_servers"])  # type: ignore[arg-type]
         print(f"  [{key}] {uc['name']}")
         print(f"      {uc['description']}")
         print(f"      Servidores padrão: {servers_str}\n")
     print("  [4] Informar IPs de DNS manualmente")
+    print("  [5] Arquivar (TAR/ZIP) e/ou enviar via SCP um resultado já existente")
     print("=" * 68)
 
-    choice = input("Escolha uma opção [1-4] (Enter para 1): ").strip() or "1"
+    default_opt = "0" if env_cfg.dns_servers else "1"
+    opt_range = "0-5" if env_cfg.dns_servers else "1-5"
+    choice = input(f"Escolha uma opção [{opt_range}] (Enter para {default_opt}): ").strip() or default_opt
 
-    if choice in USE_CASES:
+    if choice == "5":
+        existing_dir = _select_existing_result_dir_interactive()
+        if existing_dir is None:
+            return "Cancelado", [], ExportConfig(), None
+        export_cfg = configure_export_options_interactive(require_action=True, env_cfg=env_cfg)
+        return "Arquivar/Enviar Resultado Existente", [], export_cfg, existing_dir
+
+    if choice == "0" and env_cfg.dns_servers:
+        servers = list(env_cfg.dns_servers)
+        use_case_name = f"Configuração .env ({', '.join(servers)})"
+    elif choice in USE_CASES:
         uc = USE_CASES[choice]
         default_servers: List[str] = list(uc["dns_servers"])  # type: ignore[arg-type]
         prompt = (
@@ -1515,15 +2532,21 @@ def select_dns_servers_interactive() -> Tuple[str, List[str]]:
         custom = input(prompt).strip()
         if custom:
             servers = [s.strip() for s in re.split(r"[,\s]+", custom) if s.strip()]
-            return str(uc["name"]), servers
-        return str(uc["name"]), default_servers
+            use_case_name = str(uc["name"])
+        else:
+            servers = default_servers
+            use_case_name = str(uc["name"])
+    else:
+        while True:
+            raw = input("Digite os IPs dos servidores DNS separados por vírgula ou espaço (ex: 10.36.41.115, 8.8.8.8): ").strip()
+            servers = [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
+            if servers:
+                use_case_name = "Use Case Customizado (Manual)"
+                break
+            print("Por favor, informe pelo menos um endereço IP de servidor DNS válido.")
 
-    while True:
-        raw = input("Digite os IPs dos servidores DNS separados por vírgula ou espaço (ex: 10.36.41.115, 8.8.8.8): ").strip()
-        servers = [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
-        if servers:
-            return "Use Case Customizado (Manual)", servers
-        print("Por favor, informe pelo menos um endereço IP de servidor DNS válido.")
+    export_cfg = configure_export_options_interactive(require_action=False, env_cfg=env_cfg)
+    return use_case_name, servers, export_cfg, None
 
 
 # ==============================================================================
@@ -1534,6 +2557,15 @@ def select_dns_servers_interactive() -> Tuple[str, List[str]]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Validador multiplataforma de bloqueio DNS (Whalebone) com captura de evidências."
+    )
+    parser.add_argument(
+        "--env-file",
+        help="Caminho para arquivo .env de configuração (padrão: ./.env se existir).",
+    )
+    parser.add_argument(
+        "--from-env",
+        action="store_true",
+        help="Executa diretamente usando as configurações do arquivo .env sem abrir o menu interativo.",
     )
     parser.add_argument(
         "--use-case",
@@ -1559,6 +2591,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         help="Diretório de saída dos resultados (padrão: ./test_results_YYYYMMDD_HHMMSS).",
+    )
+    parser.add_argument(
+        "--archive",
+        choices=["none", "tar", "zip"],
+        default=None,
+        help="Compacta o diretório de resultados ao final em 'tar' (.tar.gz) ou 'zip' (.zip).",
+    )
+    parser.add_argument(
+        "--scp-host",
+        help="Endereço IP ou hostname do servidor remoto para envio do resultado via SCP.",
+    )
+    parser.add_argument(
+        "--scp-port",
+        type=int,
+        default=None,
+        help="Porta SSH/SCP do servidor remoto (padrão: 22).",
+    )
+    parser.add_argument(
+        "--scp-user",
+        help="Usuário para autenticação SSH/SCP no servidor remoto.",
+    )
+    parser.add_argument(
+        "--scp-path",
+        default=None,
+        help="Caminho de destino no servidor remoto via SCP (padrão: ~/).",
     )
     return parser.parse_args()
 
@@ -1600,24 +2657,112 @@ def resolve_output_dir(requested_dir: Optional[str], timestamp: str) -> Path:
     return Path(f"./{default_folder_name}")
 
 
+def finalize_export(
+    output_dir: Path,
+    export_cfg: ExportConfig,
+    logger: Optional[Logger] = None,
+) -> Optional[Path]:
+    """
+    Executa o arquivamento (TAR ou ZIP) e/ou envio via SCP conforme configurado pelo usuário.
+    """
+    target_to_send = output_dir
+    archive_path: Optional[Path] = None
+
+    if export_cfg.archive_format in ("tar", "zip"):
+        archive_path = create_results_archive(output_dir, export_cfg.archive_format, logger=logger)
+        if archive_path is not None:
+            target_to_send = archive_path
+
+    if export_cfg.scp_enabled:
+        send_via_scp(target_to_send, export_cfg, logger=logger)
+
+    return archive_path
+
+
+def _build_cli_export_config(args: argparse.Namespace, env_cfg: Optional[EnvConfig] = None) -> ExportConfig:
+    env_cfg = env_cfg or EnvConfig()
+    archive_format = args.archive if args.archive is not None else (env_cfg.archive_format or "none")
+    scp_host = args.scp_host or env_cfg.scp_host or ""
+    scp_port = args.scp_port if args.scp_port is not None else (env_cfg.scp_port or 22)
+    scp_user = args.scp_user or env_cfg.scp_user or ""
+    scp_remote_path = args.scp_path or env_cfg.scp_remote_path or "~/"
+    scp_enabled = bool(args.scp_host) or bool(env_cfg.scp_enabled and scp_host)
+    scp_password = env_cfg.scp_password or ""
+
+    if scp_enabled:
+        while not scp_host:
+            scp_host = input("Servidor remoto (IP ou Hostname, ex: 192.168.1.50): ").strip()
+        while not scp_user:
+            scp_user = input(f"Usuário (User) para {scp_host}: ").strip()
+        if not scp_password:
+            scp_password = _prompt_password_secure(
+                f"Senha (Password) para {scp_user}@{scp_host} (digitação oculta): "
+            )
+    return ExportConfig(
+        archive_format=archive_format,
+        scp_enabled=scp_enabled,
+        scp_host=scp_host,
+        scp_port=scp_port,
+        scp_user=scp_user,
+        scp_password=scp_password,
+        scp_remote_path=scp_remote_path,
+    )
+
+
 def main() -> int:
     args = parse_args()
+    env_cfg = load_env_config(args.env_file)
+    existing_dir: Optional[Path] = None
 
-    # Determina os servidores DNS (via CLI ou Menu Interativo)
+    # Determina os servidores DNS e opções de exportação (via CLI, .env AUTO_RUN/--from-env ou Menu Interativo)
     if args.dns:
         flat_dns: List[str] = []
         for item in args.dns:
-            flat_dns.extend([s.strip() for s in re.split(r"[,\s]+", item) if s.strip()])
+            flat_dns.extend([s.strip() for s in re.split(r"[,;\s]+", item) if s.strip()])
         use_case_label = f"CLI Custom DNS ({', '.join(flat_dns)})"
         dns_servers = flat_dns
+        export_cfg = _build_cli_export_config(args, env_cfg=env_cfg)
     elif args.use_case:
         uc = USE_CASES[args.use_case]
         use_case_label = str(uc["name"])
         dns_servers = list(uc["dns_servers"])  # type: ignore[arg-type]
+        export_cfg = _build_cli_export_config(args, env_cfg=env_cfg)
+    elif (args.from_env or env_cfg.auto_run) and env_cfg.dns_servers:
+        dns_servers = list(env_cfg.dns_servers)
+        use_case_label = f"Configuração .env ({', '.join(dns_servers)})"
+        export_cfg = _build_cli_export_config(args, env_cfg=env_cfg)
     else:
-        use_case_label, dns_servers = select_dns_servers_interactive()
+        use_case_label, dns_servers, export_cfg, existing_dir = select_dns_servers_interactive(env_cfg=env_cfg)
+        if args.archive is not None:
+            export_cfg.archive_format = args.archive
+        if args.scp_host and not export_cfg.scp_enabled:
+            cli_cfg = _build_cli_export_config(args, env_cfg=env_cfg)
+            export_cfg.scp_enabled = True
+            export_cfg.scp_host = cli_cfg.scp_host
+            export_cfg.scp_port = cli_cfg.scp_port
+            export_cfg.scp_user = cli_cfg.scp_user
+            export_cfg.scp_password = cli_cfg.scp_password
+            export_cfg.scp_remote_path = cli_cfg.scp_remote_path
 
-    urls = args.urls if args.urls else DEFAULT_URLS
+    # Caso o usuário tenha escolhido a opção [5] do menu (arquivar/enviar resultado existente)
+    if existing_dir is not None:
+        log_file = existing_dir / "run.log"
+        logger = Logger(log_file) if log_file.exists() else None
+        _log_or_print(logger, "============================================================")
+        _log_or_print(logger, f"Processando diretório existente: {existing_dir.resolve()}")
+        finalize_export(existing_dir, export_cfg, logger=logger)
+        _log_or_print(logger, "============================================================")
+        return 0
+
+    if not dns_servers:
+        return 1
+
+    if args.urls:
+        urls = [_normalize_domain_or_url(u) for item in args.urls for u in re.split(r"[,;\s]+", item) if u.strip()]
+    elif env_cfg.domains:
+        urls = list(env_cfg.domains)
+    else:
+        urls = DEFAULT_URLS
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = resolve_output_dir(args.output_dir, timestamp)
@@ -1636,6 +2781,12 @@ def main() -> int:
     logger.log(f"Cenário Selecionado : {use_case_label}")
     logger.log(f"Servidores DNS      : {', '.join(dns_servers)}")
     logger.log(f"Navegador Detectado : {browser_bin or 'Nenhum (usando modo Card Visual / ADB)'}")
+    if export_cfg.archive_format != "none":
+        logger.log(f"Arquivamento Final  : {export_cfg.archive_format.upper()}")
+    if export_cfg.scp_enabled:
+        logger.log(
+            f"Destino Remoto SCP  : {export_cfg.scp_user}@{export_cfg.scp_host}:{export_cfg.scp_remote_path} (porta {export_cfg.scp_port})"
+        )
     logger.log("============================================================")
 
     csv_headers = [
@@ -1787,6 +2938,11 @@ def main() -> int:
     logger.log(f"Concluído! Resultados salvos em: {output_dir.resolve()}")
     logger.log(f"Relatório CSV : {report_csv.resolve()}")
     logger.log(f"Log de Execução: {log_file.resolve()}")
+    if export_cfg.archive_format != "none" or export_cfg.scp_enabled:
+        logger.log("------------------------------------------------------------")
+        archive_file = finalize_export(output_dir, export_cfg, logger=logger)
+        if archive_file is not None:
+            logger.log(f"Arquivo Compactado: {archive_file.resolve()}")
     logger.log("============================================================")
     return 0
 

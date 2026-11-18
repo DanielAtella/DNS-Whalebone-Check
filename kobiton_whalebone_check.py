@@ -26,6 +26,7 @@ import argparse
 import base64
 import csv
 import datetime
+import html
 import json
 import logging
 import os
@@ -51,7 +52,7 @@ import android_whalebone_check as awc
 DEFAULT_KOBITON_SERVER_URL = "https://api.kobiton.com/wd/hub"
 DEFAULT_KOBITON_API_URL = "https://api.kobiton.com/v1"
 DEFAULT_DNS_SERVERS: List[str] = ["10.36.41.114", "8.8.8.8"]
-DEFAULT_BLOCK_IPS: List[str] = ["212.113.177.247"]
+DEFAULT_BLOCK_IPS: List[str] = ["10.36.41.115"]
 APN_CHECK_SCHEDULE_SECONDS: Tuple[int, ...] = (5, 15, 45, 120, 300)
 PAGE_WAIT_SCHEDULE_SECONDS: Tuple[int, ...] = (5, 15, 30, 60, 120)
 
@@ -210,6 +211,7 @@ class CellularApnTelemetry:
     ipv4_addresses: List[str] = field(default_factory=list)
     ipv6_addresses: List[str] = field(default_factory=list)
     dns_addresses: List[str] = field(default_factory=list)
+    dns_match_state: str = ""
     wifi_initially_enabled: Optional[bool] = None
     wifi_disabled_during_tests: bool = False
     wifi_restored: Optional[bool] = None
@@ -217,10 +219,49 @@ class CellularApnTelemetry:
 
 
 @dataclass
+class TlsCertificateInfo:
+    subject: str = ""
+    issuer: str = ""
+    not_after: str = ""
+    sha256_fingerprint: str = ""
+    verify_result: str = ""
+    protocol: str = ""
+    cipher: str = ""
+    pem: str = ""
+    pem_file: str = ""
+
+
+@dataclass
+class NetworkRequestItem:
+    url: str
+    resource_type: str = "document"
+    method: str = "GET"
+    status_code: Optional[int] = None
+    size_bytes: int = 0
+    start_offset_ms: int = 0
+    dns_ms: Optional[int] = None
+    tcp_ms: Optional[int] = None
+    tls_ms: Optional[int] = None
+    pretransfer_ms: Optional[int] = None
+    redirect_ms: Optional[int] = None
+    ttfb_ms: Optional[int] = None
+    duration_ms: int = 0
+    size_header_bytes: int = 0
+    speed_download_bps: Optional[float] = None
+    num_redirects: int = 0
+    http_version: str = ""
+    content_type: str = ""
+    effective_url: str = ""
+    remote_ip: str = ""
+    error: str = ""
+
+
+@dataclass
 class WaterfallEntry:
     category: str
     target: str
     status: str = "UNKNOWN"
+    dns_server_used: List[str] = field(default_factory=list)
     dns_rtt_ms: Optional[int] = None
     tcp_rtt_ms: Optional[int] = None
     tls_rtt_ms: Optional[int] = None
@@ -230,6 +271,8 @@ class WaterfallEntry:
     http_status: Optional[int] = None
     content_bytes: int = 0
     resolved_ips: List[str] = field(default_factory=list)
+    tls_certificate: Optional[TlsCertificateInfo] = None
+    network_requests: List[NetworkRequestItem] = field(default_factory=list)
     details: str = ""
 
 
@@ -1142,8 +1185,6 @@ def detect_initial_sim_and_airplane_state(
         sim1_msisdn = sim1_msisdn or ui_s1
         sim2_msisdn = sim2_msisdn or ui_s2
 
-    png_path = output_dir / "screenshots" / "01_sim_initial_state.png"
-    has_png = backend.screencap(png_path)
     log.info(
         "Estado inicial detectado (%s): SIM1=%s (MSISDN=%s, ICCID=%s) | SIM2=%s (MSISDN=%s, ICCID=%s) | Modo Avião=%s",
         method,
@@ -1168,7 +1209,7 @@ def detect_initial_sim_and_airplane_state(
             f"SIM1={sim1} (MSISDN={sim1_msisdn or '-'}, ICCID={sim1_iccid or '-'}), "
             f"SIM2={sim2} (MSISDN={sim2_msisdn or '-'}, ICCID={sim2_iccid or '-'}), airplane={airplane}"
         ),
-        screenshot_path=str(png_path) if has_png else "",
+        screenshot_path="",
     )
 
 
@@ -1228,9 +1269,7 @@ def ensure_target_sim_active(
     else:
         log.info("SIM2 já está %s.", "ativo" if want_sim2 else "desativado")
 
-    png_path = output_dir / "screenshots" / f"02_sim{target_slot}_active.png"
-    has_png = backend.screencap(png_path)
-    return sim1, sim2, str(png_path) if has_png else ""
+    return sim1, sim2, ""
 
 
 def ensure_sim1_active_sim2_inactive(
@@ -1320,8 +1359,8 @@ def toggle_airplane_mode_reregister(
         backend,
         enabled=True,
         keep_wifi=False,
-        output_dir=output_dir,
-        screenshot_name="03a_airplane_mode_on.png",
+        output_dir=None,
+        screenshot_name="",
         log=log,
     )
     time.sleep(max(1, wait_on_sec))
@@ -1331,8 +1370,8 @@ def toggle_airplane_mode_reregister(
         backend,
         enabled=False,
         keep_wifi=False,
-        output_dir=output_dir,
-        screenshot_name="03b_airplane_mode_off_reregistered.png",
+        output_dir=None,
+        screenshot_name="",
         log=log,
     )
     time.sleep(max(1, wait_off_sec))
@@ -1420,17 +1459,120 @@ def _sec_str_to_ms(val: Optional[str]) -> Optional[int]:
         return None
 
 
+def _collect_device_tls_cert(
+    backend: KobitonBackend,
+    host: str,
+    target_ip: str,
+    port: int = 443,
+    output_dir: Optional[Path] = None,
+) -> Optional[TlsCertificateInfo]:
+    """Coleta o certificado entregue no handshake TLS diretamente no dispositivo Android (`openssl` ou `curl -vvI`)."""
+    if backend.shell_supported is False or not host:
+        return None
+    connect_target = f"{target_ip or host}:{port}"
+    info = TlsCertificateInfo()
+
+    res = backend.shell(
+        [
+            "sh",
+            "-c",
+            (
+                f"OUT=$(echo | openssl s_client -showcerts -connect {connect_target} -servername {host} 2>&1); "
+                f"echo \"$OUT\"; "
+                f"echo \"$OUT\" | openssl x509 -noout -subject -issuer -dates -fingerprint -sha256 2>/dev/null"
+            ),
+        ],
+        timeout=10,
+    )
+    if res.returncode == 0 and res.stdout:
+        pem_match = re.search(
+            r"(-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----)",
+            res.stdout,
+            re.DOTALL,
+        )
+        if pem_match:
+            info.pem = pem_match.group(1).strip()
+        for line in res.stdout.splitlines():
+            line_s = line.strip()
+            low = line_s.lower()
+            if low.startswith("subject="):
+                info.subject = line_s.split("=", 1)[1].strip()
+            elif low.startswith("issuer="):
+                info.issuer = line_s.split("=", 1)[1].strip()
+            elif low.startswith("notafter="):
+                info.not_after = line_s.split("=", 1)[1].strip()
+            elif "fingerprint=" in low:
+                info.sha256_fingerprint = line_s.split("=", 1)[1].strip()
+            elif "verify return code:" in low:
+                info.verify_result = line_s.split(":", 1)[1].strip()
+            elif low.startswith("protocol"):
+                info.protocol = line_s.split(":", 1)[-1].strip()
+            elif low.startswith("cipher"):
+                info.cipher = line_s.split(":", 1)[-1].strip()
+
+    # Fallback via `curl -vvI -k` no Android caso `openssl` não esteja instalado no aparelho
+    if not (info.subject or info.issuer or info.pem):
+        curl_cert = backend.shell(
+            ["curl", "-vvI", "-k", "--max-time", "6", f"https://{host}:{port}/"],
+            timeout=9,
+        )
+        combined = f"{curl_cert.stdout}\n{curl_cert.stderr}"
+        for line in combined.splitlines():
+            line_s = line.strip()
+            low = line_s.lower()
+            if "subject:" in low:
+                info.subject = line_s.split("subject:", 1)[1].strip()
+            elif "issuer:" in low:
+                info.issuer = line_s.split("issuer:", 1)[1].strip()
+            elif "expire date:" in low:
+                info.not_after = line_s.split("expire date:", 1)[1].strip()
+            elif "ssl certificate verify" in low:
+                info.verify_result = line_s
+
+    if not (info.subject or info.issuer or info.sha256_fingerprint or info.pem):
+        return None
+
+    return info
+
+
+def _extract_subresource_urls(html_body: str, base_url: str, limit: int = 12) -> List[Tuple[str, str]]:
+    """Extrai sub-recursos (script, stylesheet, img) do HTML para compor a timeline de requests."""
+    if not html_body:
+        return []
+    found: List[Tuple[str, str]] = []
+    seen = {base_url}
+    patterns = (
+        ("script", re.compile(r'<script[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)),
+        ("stylesheet", re.compile(r'<link[^>]+rel=["\'][^"\']*stylesheet[^"\']*["\'][^>]+href=["\']([^"\']+)["\']', re.IGNORECASE)),
+        ("image", re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)),
+    )
+    for rtype, pat in patterns:
+        for m in pat.finditer(html_body):
+            raw = m.group(1).strip()
+            if not raw or raw.startswith("data:") or raw.startswith("javascript:"):
+                continue
+            abs_url = urllib.parse.urljoin(base_url, raw)
+            if abs_url not in seen:
+                seen.add(abs_url)
+                found.append((rtype, abs_url))
+            if len(found) >= limit:
+                return found
+    return found
+
+
 def measure_url_waterfall(
     url: str,
     dns_servers: Sequence[str],
     block_ips: Sequence[str],
     backend: Optional[KobitonBackend] = None,
     timeout: int = 6,
+    active_dns_servers: Sequence[str] = (),
+    output_dir: Optional[Path] = None,
 ) -> Tuple[awc.EndpointProbeResult, WaterfallEntry]:
     """
     Sonda o endpoint EXCLUSIVAMENTE a partir do dispositivo Android (via `mobile: shell`),
-    medindo RTT, waterfall (`curl` / `ping` / `toybox nc`) e confirmando bloqueio pelo IP (`block_ips`).
-    Nunca executa resolução DNS ou conexões de rede a partir do host.
+    medindo RTT, timeline DevTools (requests, HTTP status, size, DNS/TCP/TLS/TTFB),
+    certificado TLS e confirmando bloqueio pelo IP (`block_ips`).
     """
     t_total_start = time.monotonic()
     parsed = urllib.parse.urlparse(url)
@@ -1438,6 +1580,7 @@ def measure_url_waterfall(
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     block_set = set(block_ips) | awc.SINKHOLE_IPS
 
+    dns_used: List[str] = list(active_dns_servers)
     resolved_ips: List[str] = []
     dns_rtt_ms: Optional[int] = None
     tcp_rtt_ms: Optional[int] = None
@@ -1446,9 +1589,17 @@ def measure_url_waterfall(
     device_ping_rtt_ms: Optional[float] = None
     http_status: Optional[int] = None
     content_bytes = 0
+    tls_cert: Optional[TlsCertificateInfo] = None
+    network_requests: List[NetworkRequestItem] = []
     notes: List[str] = []
 
     if backend is not None and backend.shell_supported is not False and host:
+        if not dns_used:
+            for prop in ("net.dns1", "net.dns2"):
+                d_ip = (backend.shell(["getprop", prop], timeout=4).stdout or "").strip()
+                if d_ip and d_ip not in dns_used:
+                    dns_used.append(d_ip)
+
         # 1. Ping no dispositivo Android: resolve via DNS do Android (APN SIM1) e mede RTT
         t_ping = time.monotonic()
         ping_res = backend.shell(["ping", "-c", "1", "-W", "8", host], timeout=11)
@@ -1463,18 +1614,24 @@ def measure_url_waterfall(
         if dns_rtt_ms is None:
             dns_rtt_ms = ping_wall_ms
 
-        # 2. Curl no dispositivo Android (se disponível) para waterfall completo no aparelho
+        # 2. Curl --write-out no dispositivo Android para coletar todas as métricas de performance
         curl_fmt = (
-            "http=%{http_code}|dns=%{time_namelookup}|tcp=%{time_connect}|"
-            "tls=%{time_appconnect}|ttfb=%{time_starttransfer}|total=%{time_total}|"
-            "bytes=%{size_download}|ip=%{remote_ip}"
+            "\n__CURL_METRICS__http=%{http_code}\nhttp_ver=%{http_version}\ndns=%{time_namelookup}\n"
+            "tcp=%{time_connect}\ntls=%{time_appconnect}\npretransfer=%{time_pretransfer}\n"
+            "redirect=%{time_redirect}\nttfb=%{time_starttransfer}\ntotal=%{time_total}\n"
+            "bytes=%{size_download}\nhdr_bytes=%{size_header}\nspeed=%{speed_download}\n"
+            "redirects=%{num_redirects}\nconnects=%{num_connects}\nip=%{remote_ip}\n"
+            "port=%{remote_port}\neff_url=%{url_effective}\nctype=%{content_type}\n"
+            "ssl_verify=%{ssl_verify_result}"
         )
         curl_res = backend.shell(
-            ["curl", "-sS", "-L", "-k", "-o", "/dev/null", "-w", curl_fmt, "--max-time", str(timeout), url],
+            ["curl", "-sS", "-L", "-k", "--write-out", curl_fmt, "--max-time", str(timeout), url],
             timeout=timeout + 4,
         )
-        if curl_res.returncode == 0 and "http=" in curl_res.stdout:
-            m = _parse_device_curl_metrics(curl_res.stdout)
+        html_body = ""
+        if curl_res.returncode == 0 and "__CURL_METRICS__" in curl_res.stdout:
+            html_body, metrics_raw = curl_res.stdout.rsplit("__CURL_METRICS__", 1)
+            m = _parse_device_curl_metrics(metrics_raw)
             if m.get("http", "").isdigit():
                 code = int(m["http"])
                 if code > 0:
@@ -1482,20 +1639,88 @@ def measure_url_waterfall(
             dns_rtt_ms = _sec_str_to_ms(m.get("dns")) or dns_rtt_ms
             tcp_rtt_ms = _sec_str_to_ms(m.get("tcp"))
             tls_rtt_ms = _sec_str_to_ms(m.get("tls"))
+            pretransfer_ms = _sec_str_to_ms(m.get("pretransfer"))
+            redirect_ms = _sec_str_to_ms(m.get("redirect"))
             ttfb_ms = _sec_str_to_ms(m.get("ttfb"))
+            doc_total_ms = _sec_str_to_ms(m.get("total")) or int((time.monotonic() - t_total_start) * 1000)
             if m.get("bytes", "").isdigit():
                 content_bytes = int(m["bytes"])
+            hdr_bytes = int(m["hdr_bytes"]) if m.get("hdr_bytes", "").isdigit() else 0
+            try:
+                speed_bps = float(m["speed"]) if m.get("speed") else None
+            except ValueError:
+                speed_bps = None
+            num_redirects = int(m["redirects"]) if m.get("redirects", "").isdigit() else 0
             remote_ip = m.get("ip", "").strip()
             if remote_ip and remote_ip not in resolved_ips:
                 resolved_ips.insert(0, remote_ip)
+
+            network_requests.append(
+                NetworkRequestItem(
+                    url=url,
+                    resource_type="document",
+                    method="GET",
+                    status_code=http_status,
+                    size_bytes=content_bytes,
+                    start_offset_ms=0,
+                    dns_ms=dns_rtt_ms,
+                    tcp_ms=tcp_rtt_ms,
+                    tls_ms=tls_rtt_ms,
+                    pretransfer_ms=pretransfer_ms,
+                    redirect_ms=redirect_ms,
+                    ttfb_ms=ttfb_ms,
+                    duration_ms=doc_total_ms,
+                    size_header_bytes=hdr_bytes,
+                    speed_download_bps=speed_bps,
+                    num_redirects=num_redirects,
+                    http_version=m.get("http_ver", ""),
+                    content_type=m.get("ctype", ""),
+                    effective_url=m.get("eff_url", ""),
+                    remote_ip=remote_ip,
+                )
+            )
         else:
-            # Fallback no dispositivo Android: `toybox nc` para testar conectividade TCP na porta
+            # Fallback no dispositivo Android: `toybox nc` para testar conectividade TCP na porta (e HTTP/80)
             t_tcp = time.monotonic()
-            nc_res = backend.shell(["toybox", "nc", "-z", "-w", "3", host, str(port)], timeout=6)
+            nc_res = backend.shell(["toybox", "nc", "-z", "-w", "4", host, str(port)], timeout=7)
             if nc_res.returncode == 0:
                 tcp_rtt_ms = int((time.monotonic() - t_tcp) * 1000)
             elif "not found" not in (nc_res.stderr or "").lower():
                 notes.append(f"device_tcp_closed:{port}")
+
+            if parsed.scheme == "http" and (resolved_ips or host):
+                target_h = resolved_ips[0] if resolved_ips else host
+                http_res = backend.shell(
+                    ["sh", "-c", f'printf "HEAD / HTTP/1.1\\r\\nHost: {host}\\r\\nConnection: close\\r\\n\\r\\n" | toybox nc -w 4 {target_h} {port}'],
+                    timeout=7,
+                )
+                if http_res.stdout:
+                    m_st = re.search(r"HTTP/\d(?:\.\d)?\s+(\d{3})", http_res.stdout)
+                    if m_st:
+                        http_status = int(m_st.group(1))
+
+            network_requests.append(
+                NetworkRequestItem(
+                    url=url,
+                    resource_type="document",
+                    method="GET",
+                    status_code=http_status,
+                    size_bytes=content_bytes,
+                    start_offset_ms=0,
+                    dns_ms=dns_rtt_ms,
+                    tcp_ms=tcp_rtt_ms,
+                    tls_ms=tls_rtt_ms,
+                    ttfb_ms=ttfb_ms,
+                    duration_ms=int((time.monotonic() - t_total_start) * 1000),
+                    remote_ip=resolved_ips[0] if resolved_ips else "",
+                )
+            )
+
+        # 3. Certificado TLS entregue no handshake a partir do dispositivo
+        if parsed.scheme == "https":
+            tls_cert = _collect_device_tls_cert(
+                backend, host, resolved_ips[0] if resolved_ips else "", port=port, output_dir=output_dir
+            )
     else:
         notes.append("device_shell_unavailable")
 
@@ -1531,6 +1756,7 @@ def measure_url_waterfall(
         category="probe",
         target=url,
         status=status,
+        dns_server_used=dns_used,
         dns_rtt_ms=dns_rtt_ms,
         tcp_rtt_ms=tcp_rtt_ms,
         tls_rtt_ms=tls_rtt_ms,
@@ -1540,6 +1766,8 @@ def measure_url_waterfall(
         http_status=http_status,
         content_bytes=content_bytes,
         resolved_ips=resolved_ips,
+        tls_certificate=tls_cert,
+        network_requests=network_requests,
         details="; ".join(notes) or "OK",
     )
     return probe, wf
@@ -1702,6 +1930,7 @@ def collect_cellular_apn_telemetry(
     backend: KobitonBackend,
     wifi_mgr: Optional[WifiStateManager],
     log: logging.Logger,
+    expected_dns_servers: Sequence[str] = (),
 ) -> CellularApnTelemetry:
     """Coleta telemetria completa do SIM1, APN registrada, IPv4, IPv6 e DNS recebidos da APN."""
     tel = CellularApnTelemetry()
@@ -1726,9 +1955,13 @@ def collect_cellular_apn_telemetry(
         tel.wifi_initially_enabled = wifi_mgr.initial_enabled
         tel.wifi_disabled_during_tests = wifi_mgr.disabled_by_script
 
+    if expected_dns_servers:
+        tel.dns_match_state = "SUCCESSFUL" if any(d in tel.dns_addresses for d in expected_dns_servers) else "MISMATCH"
+    state_label = "SUCCESSFUL" if tel.dns_match_state == "SUCCESSFUL" else (tel.sim_state or "-")
+
     tel.raw_summary = (
         f"SIM={tel.sim1_operator or '-'} ({tel.sim1_mcc_mnc or '-'}) | "
-        f"State={tel.sim_state or '-'} | Net={tel.network_type or '-'} | Roaming={roaming or '-'} | "
+        f"State={state_label} | Net={tel.network_type or '-'} | Roaming={roaming or '-'} | "
         f"APN={tel.apn_name or '-'} | Iface={tel.interface or '-'} | "
         f"IPv4={tel.ipv4_addresses} | IPv6={tel.ipv6_addresses} | DNS_APN={tel.dns_addresses}"
     )
@@ -1774,13 +2007,14 @@ def wait_for_sim1_apn_registration(
     output_dir: Path,
     log: logging.Logger,
     schedule: Sequence[int] = APN_CHECK_SCHEDULE_SECONDS,
+    expected_dns_servers: Sequence[str] = (),
 ) -> CellularApnTelemetry:
     """
     Confirma que o SIM1 está registrado na APN e navegando na internet antes de prosseguir.
     Se não estiver pronto, verifica nos marcos 5s, 15s, 45s, 2m (120s) e 5m (300s).
     Caso não registre/conecte até 5m, gera evidência de erro e aborta o teste.
     """
-    tel = collect_cellular_apn_telemetry(backend, wifi_mgr, log)
+    tel = collect_cellular_apn_telemetry(backend, wifi_mgr, log, expected_dns_servers=expected_dns_servers)
     if is_apn_registered(tel) and check_device_internet_connectivity(backend, log):
         log.info(
             "SIM1 registrado na APN com internet ativa. Prosseguindo. [%s]",
@@ -1796,7 +2030,7 @@ def wait_for_sim1_apn_registration(
             time.sleep(delta)
         elapsed = checkpoint
         label = f"{checkpoint}s" if checkpoint < 60 else f"{checkpoint // 60}m"
-        tel = collect_cellular_apn_telemetry(backend, wifi_mgr, log)
+        tel = collect_cellular_apn_telemetry(backend, wifi_mgr, log, expected_dns_servers=expected_dns_servers)
         if is_apn_registered(tel) and check_device_internet_connectivity(backend, log):
             log.info(
                 "SIM1 registrado na APN com internet ativa após %s. [%s]",
@@ -1839,6 +2073,128 @@ def clear_browser_cache(backend: KobitonBackend, log: logging.Logger) -> bool:
     backend.shell(["pm", "trim-caches", "100G"], timeout=8)
     log.info("Cache do navegador limpo com sucesso.")
     return True
+
+
+TERMUX_PACKAGE = "com.termux"
+TERMUX_ACTIVITY = "com.termux.app.TermuxActivity"
+
+
+def _run_termux_dns_and_curl_probe(
+    backend: KobitonBackend,
+    dns_ip: str,
+    png_path: Path,
+    log: logging.Logger,
+) -> Tuple[bool, Optional[bool], str]:
+    """
+    Abre o Termux no Android, executa `dig @<dns_ip>` e `curl --write-out`
+    (instalando `dnsutils` e `curl` via `pkg install -y` caso não existam) e
+    tira o screenshot `04_dns_connectivity_*.png` diretamente da tela do shell.
+    """
+    if backend.shell_supported is False:
+        return False, None, ""
+
+    backend.shell(["logcat", "-c"], timeout=5)
+    launch = backend.shell(["am", "start", "-n", f"{TERMUX_PACKAGE}/{TERMUX_ACTIVITY}"], timeout=8)
+    if launch.returncode != 0:
+        launch = backend.shell(
+            ["monkey", "-p", TERMUX_PACKAGE, "-c", "android.intent.category.LAUNCHER", "1"],
+            timeout=8,
+        )
+    if launch.returncode != 0:
+        return False, None, ""
+
+    time.sleep(2.5)
+    xml_init = backend.dump_ui_xml()
+    if xml_init:
+        init_nodes = awc.parse_ui_nodes(xml_init)
+        perm_btn = awc.find_node_by_labels(
+            init_nodes,
+            ("permitir", "allow", "permission_allow_button", "while using the app"),
+        )
+        if perm_btn is not None:
+            cx, cy = perm_btn.center
+            backend.tap(cx, cy)
+            time.sleep(1.0)
+            xml_init = backend.dump_ui_xml()
+            init_nodes = awc.parse_ui_nodes(xml_init)
+        term_node = awc.find_node_by_labels(init_nodes, ("terminal_view",))
+        if term_node is not None:
+            x1, y1, x2, y2 = term_node.bounds
+            backend.tap((x1 + x2) // 2, min(max(220, y1 + 180), max(220, y2 - 100)))
+            time.sleep(0.4)
+
+    fg = awc.get_foreground_package(backend)
+    if fg and TERMUX_PACKAGE not in fg:
+        return False, None, ""
+
+    def _termux_type_line(cmd_line: str, wait_s: float = 2.0, chunk_size: int = 16) -> None:
+        # `TerminalView` do Termux não é `EditText`, portanto `send_keys_active` (setText) é ignorado.
+        # Digitamos sempre via `input text` no shell do dispositivo em blocos curtos para não perder caracteres.
+        for i in range(0, len(cmd_line), chunk_size):
+            piece = cmd_line[i : i + chunk_size].replace(" ", "%s")
+            backend.shell(["input", "text", piece], timeout=8)
+            time.sleep(0.18)
+        enter_res = backend.shell(["input", "keyevent", "66"], timeout=6)
+        if enter_res.returncode != 0:
+            backend.keyevent("KEYCODE_ENTER")
+        time.sleep(wait_s)
+
+    dig_cmd = f"dig @{dns_ip} malware.test.attacker.online +noall +comments +question +answer +stats +time=4 +tries=1"
+    curl_cmd = (
+        "curl -sS -k -m 6 -o /dev/null --write-out "
+        "HTTP_Status:%{http_code}\\\\\\\\n"
+        "Remote_IP:%{remote_ip}:%{remote_port}\\\\\\\\n"
+        "DNS_Lookup:%{time_namelookup}s\\\\\\\\n"
+        "TCP_Connect:%{time_connect}s\\\\\\\\n"
+        "TLS_Handshake:%{time_appconnect}s\\\\\\\\n"
+        "TTFB:%{time_starttransfer}s\\\\\\\\n"
+        "Total_Time:%{time_total}s\\\\\\\\n"
+        "Size_Bytes:%{size_download}B\\\\\\\\n "
+        "https://malware.test.attacker.online"
+    )
+
+    # Verifica silenciosamente via `run-as` (sem poluir o terminal do Termux) se `dig` e `curl` já existem
+    chk_tools = backend.shell(
+        [
+            "run-as",
+            TERMUX_PACKAGE,
+            "sh",
+            "-c",
+            "test -x /data/data/com.termux/files/usr/bin/dig && test -x /data/data/com.termux/files/usr/bin/curl",
+        ],
+        timeout=5,
+    )
+    chk_err = (chk_tools.stderr or "").lower()
+    if chk_tools.returncode != 0 and "not debuggable" not in chk_err and "permission" not in chk_err and "unknown package" not in chk_err:
+        log.info("Comandos `dig`/`curl` ausentes no Termux; instalando via `pkg install -y dnsutils curl`...")
+        _termux_type_line("yes | pkg install -y dnsutils curl", wait_s=25.0)
+
+    _termux_type_line("clear", wait_s=1.0)
+    _termux_type_line(dig_cmd, wait_s=4.5)
+    _termux_type_line(curl_cmd, wait_s=5.0)
+
+    xml = backend.dump_ui_xml()
+    screen_low = xml.lower()
+    if any(
+        err in screen_low
+        for err in ("no command dig", "no command curl", "dig: not found", "curl: not found", "command not found")
+    ):
+        log.info("Comandos `dig`/`curl` ausentes no Termux; instalando via `pkg install -y dnsutils curl`...")
+        _termux_type_line("yes | pkg install -y dnsutils curl", wait_s=25.0)
+        _termux_type_line("clear", wait_s=1.0)
+        _termux_type_line(dig_cmd, wait_s=4.5)
+        _termux_type_line(curl_cmd, wait_s=5.0)
+        xml = backend.dump_ui_xml()
+        screen_low = xml.lower()
+
+    dig_ok: Optional[bool] = None
+    if "status: noerror" in screen_low or "query time:" in screen_low or "answer section" in screen_low:
+        dig_ok = True
+    elif "connection timed out" in screen_low or "no servers could be reached" in screen_low:
+        dig_ok = False
+
+    has_shot = backend.screencap(png_path)
+    return has_shot, dig_ok, "termux_dig_curl_shell"
 
 
 def test_dns_server_connectivity(
@@ -1888,27 +2244,42 @@ def test_dns_server_connectivity(
         else:
             notes.append("device_shell_unavailable")
 
+        safe_ip = re.sub(r"[^a-zA-Z0-9._-]+", "_", dns_ip)
+        png_path = output_dir / "screenshots" / f"04_dns_connectivity_{idx:02d}_{safe_ip}.png"
+        termux_shot, termux_dig_ok, termux_note = _run_termux_dns_and_curl_probe(backend, dns_ip, png_path, log)
+        if termux_dig_ok is not None:
+            device_dns_ok = termux_dig_ok
+        if termux_note:
+            notes.append(termux_note)
+
         latency_ms = int((time.monotonic() - t0) * 1000)
         if device_ping_ok or device_tcp_53_ok or device_dns_ok:
             status = "REACHABLE"
         else:
             status = "UNREACHABLE"
 
-        safe_ip = re.sub(r"[^a-zA-Z0-9._-]+", "_", dns_ip)
-        png_path = output_dir / "screenshots" / f"04_dns_connectivity_{idx:02d}_{safe_ip}.png"
-        awc.render_evidence_card(
-            png_path,
-            title=f"Device DNS Connectivity: {dns_ip}",
-            status=status,
-            bypass_risk="N/A",
-            lines=[
-                f"Servidor DNS destino: {dns_ip}:53 (testado no Android)",
-                f"Device ping: {device_ping_ok} (RTT: {device_ping_rtt_ms} ms)",
-                f"Device TCP/53: {device_tcp_53_ok} | Device nslookup: {device_dns_ok}",
-                f"Latencia total: {latency_ms} ms",
-                f"Detalhes: {'; '.join(notes) or 'OK'}",
-            ],
-        )
+        if termux_shot and png_path.is_file():
+            awc.annotate_screenshot_with_banner(
+                png_path,
+                title=f"Termux DNS & Curl Probe: @{dns_ip}",
+                subtitle=f"dig @{dns_ip} + curl --write-out | Ping: {device_ping_ok} ({device_ping_rtt_ms}ms) | TCP/53: {device_tcp_53_ok}",
+                status=status,
+                bypass_risk="N/A",
+            )
+        else:
+            awc.render_evidence_card(
+                png_path,
+                title=f"Device DNS Connectivity: {dns_ip}",
+                status=status,
+                bypass_risk="N/A",
+                lines=[
+                    f"Servidor DNS destino: {dns_ip}:53 (testado no Android)",
+                    f"Device ping: {device_ping_ok} (RTT: {device_ping_rtt_ms} ms)",
+                    f"Device TCP/53: {device_tcp_53_ok} | Device DNS/dig: {device_dns_ok}",
+                    f"Latencia total: {latency_ms} ms",
+                    f"Detalhes: {'; '.join(notes) or 'OK'}",
+                ],
+            )
 
         log.info(
             "Conectividade DNS (Android) %s -> %s (ping=%s rtt=%sms, tcp53=%s, nslookup=%s, %dms)",
@@ -2124,8 +2495,116 @@ CERT_PROCEED_LABELS = (
 )
 
 
-def _proceed_past_chrome_cert_warning(backend: KobitonBackend, log: logging.Logger) -> bool:
-    """Na tela de erro de certificado do Chrome, clica em Avançadas e depois em Avançar para o site."""
+def _classify_kobiton_screen_text(nodes: Sequence[awc.UINode]) -> Tuple[str, List[str], str]:
+    """
+    Classifica o conteúdo do ecrã do Chrome evitando falso positivo de 'blocked'
+    quando o servidor de sinkhole Whalebone exibe 'This site is not blocked'.
+    """
+    texts = [n.label for n in nodes if n.label]
+    if not texts:
+        return "UNKNOWN", [], ""
+    joined = " | ".join(texts)
+    lower = joined.lower()
+    snippet = joined[:240]
+
+    if "this site is not blocked" in lower or "nothing is blocked for you" in lower:
+        return "SINKHOLE_NOT_BLOCKED_MSG", ["sinkhole_unblocked_msg"], snippet
+
+    return awc.classify_chrome_screen_text(nodes)
+
+
+def _capture_chrome_certificate_viewer_screenshot(
+    backend: KobitonBackend,
+    cert_details_png: Path,
+    log: logging.Logger,
+) -> bool:
+    """
+    Abre o Visualizador de Certificados do próprio Chrome (ícone de status na barra de URL ->
+    A ligação não é segura -> Informações do certificado) e tira o screenshot do certificado de sinkhole.
+    """
+    nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
+    status_icon = next(
+        (
+            n
+            for n in nodes
+            if any(
+                rid in n.resource_id
+                for rid in ("location_bar_status_icon", "location_bar_status", "security_button")
+            )
+            or any(
+                lbl in (n.label or "").lower()
+                for lbl in (
+                    "ver informações do site",
+                    "view site information",
+                    "informações do site",
+                    "site information",
+                    "não seguro",
+                    "not secure",
+                )
+            )
+        ),
+        None,
+    )
+    if not status_icon:
+        return False
+
+    log.info("Abrindo informações do site/certificado no Chrome...")
+    backend.tap(*status_icon.center)
+    time.sleep(1.2)
+    nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
+    steps = 1
+
+    conn_row = awc.find_node_by_labels(
+        nodes,
+        (
+            "a ligação não é segura",
+            "sua conexão não é segura",
+            "connection is not secure",
+            "ligação",
+            "conexão",
+            "connection",
+        ),
+    )
+    if conn_row:
+        backend.tap(*conn_row.center)
+        time.sleep(1.2)
+        nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
+        steps += 1
+
+    cert_row = awc.find_node_by_labels(
+        nodes,
+        (
+            "informações do certificado",
+            "informacoes do certificado",
+            "detalhes do certificado",
+            "certificate information",
+            "certificate details",
+            "certificate viewer",
+            "certificado",
+            "certificate",
+        ),
+    )
+    if cert_row:
+        backend.tap(*cert_row.center)
+        time.sleep(1.2)
+        steps += 1
+
+    captured = backend.screencap(cert_details_png)
+    for _ in range(steps):
+        backend.keyevent("KEYCODE_BACK")
+        time.sleep(0.6)
+    return captured
+
+
+def _proceed_past_chrome_cert_warning(
+    backend: KobitonBackend,
+    log: logging.Logger,
+    cert_details_png: Optional[Path] = None,
+) -> bool:
+    """
+    Na tela de erro de certificado do Chrome, clica em Avançadas, tira print dos
+    detalhes do certificado de sinkhole no próprio browser e clica em Avançar para o site.
+    """
     nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
     adv_btn = awc.find_node_by_labels(nodes, CERT_ADVANCED_LABELS)
     if adv_btn:
@@ -2134,11 +2613,22 @@ def _proceed_past_chrome_cert_warning(backend: KobitonBackend, log: logging.Logg
         time.sleep(1.5)
         nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
 
+    # Tira screenshot do certificado de sinkhole diretamente no browser (detalhes expandidos ou viewer)
+    if cert_details_png is not None:
+        err_node = next((n for n in nodes if "err_cert_" in (n.label or "").lower()), None)
+        if err_node and err_node.clickable:
+            backend.tap(*err_node.center)
+            time.sleep(1.2)
+            nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
+        backend.screencap(cert_details_png)
+
     proceed_btn = awc.find_node_by_labels(nodes, CERT_PROCEED_LABELS)
     if not proceed_btn:
         backend.swipe(540, 1400, 540, 700, 350)
         time.sleep(1.2)
         nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
+        if cert_details_png is not None and not cert_details_png.is_file():
+            backend.screencap(cert_details_png)
         proceed_btn = awc.find_node_by_labels(nodes, CERT_PROCEED_LABELS)
 
     if proceed_btn:
@@ -2153,7 +2643,18 @@ def _proceed_past_chrome_cert_warning(backend: KobitonBackend, log: logging.Logg
 def _close_chrome_tab(backend: KobitonBackend, log: logging.Logger) -> None:
     """Fecha a aba atual do Chrome via seletor de abas ou força encerramento se necessário."""
     nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
-    tab_btn = next((n for n in nodes if "tab_switcher_button" in n.resource_id), None)
+    tab_btn = next(
+        (
+            n
+            for n in nodes
+            if "tab_switcher" in n.resource_id
+            or any(
+                k in (n.label or "").lower()
+                for k in ("switch or close tabs", "trocar ou fechar separadores", "alternar ou fechar guias")
+            )
+        ),
+        None,
+    )
     if tab_btn:
         backend.tap(*tab_btn.center)
         time.sleep(1.0)
@@ -2175,6 +2676,173 @@ def _close_chrome_tab(backend: KobitonBackend, log: logging.Logger) -> None:
     # Fallback: encerra a instância do Chrome para não acumular abas abertas
     backend.shell(["am", "force-stop", awc.CHROME_PACKAGE], timeout=6)
     log.debug("Página do Chrome encerrada via force-stop.")
+
+
+def _close_all_chrome_tabs(backend: KobitonBackend, log: logging.Logger) -> None:
+    """Fecha todas as abas abertas no Chrome antes de encerrar o aplicativo."""
+    try:
+        nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
+        tab_btn = next(
+            (
+                n
+                for n in nodes
+                if "tab_switcher" in n.resource_id
+                or any(
+                    k in (n.label or "").lower()
+                    for k in ("switch or close tabs", "trocar ou fechar separadores", "alternar ou fechar guias")
+                )
+            ),
+            None,
+        )
+        if tab_btn:
+            backend.tap(*tab_btn.center)
+            time.sleep(1.2)
+            nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
+            menu_btn = awc.find_node_by_labels(nodes, ("more options", "mais opções", "mais opcoes"))
+            if menu_btn:
+                backend.tap(*menu_btn.center)
+                time.sleep(1.0)
+                nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
+                close_all = awc.find_node_by_labels(
+                    nodes, ("close all tabs", "fechar todos os separadores", "fechar todas as guias")
+                )
+                if close_all:
+                    backend.tap(*close_all.center)
+                    time.sleep(1.0)
+                    nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
+                    confirm = awc.find_node_by_labels(
+                        nodes, ("close all", "fechar tudo", "fechar todos", "ok")
+                    )
+                    if confirm and confirm.clickable:
+                        backend.tap(*confirm.center)
+                        time.sleep(1.0)
+    finally:
+        backend.shell(["am", "force-stop", awc.CHROME_PACKAGE], timeout=6)
+        log.info("Abas fechadas e navegador Chrome encerrado ao término dos testes.")
+
+
+def _reload_chrome_page(backend: KobitonBackend, url: str, host: str, log: logging.Logger) -> None:
+    """Força nova resolução DNS no aparelho e recarrega a página atual no Chrome."""
+    if host and backend.shell_supported is not False:
+        backend.shell(["ping", "-c", "1", "-W", "4", host], timeout=6)
+    nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
+    reload_btn = next(
+        (
+            n
+            for n in nodes
+            if "refresh_button" in n.resource_id
+            or "reload" in n.resource_id
+            or any(k in (n.label or "").lower() for k in ("reload", "recarregar", "atualizar"))
+        ),
+        None,
+    )
+    if reload_btn:
+        backend.tap(*reload_btn.center)
+        return
+    menu_btn = awc.find_node_by_labels(nodes, ("more options", "mais opções", "mais opcoes"))
+    if menu_btn:
+        backend.tap(*menu_btn.center)
+        time.sleep(1.0)
+        nodes = awc.parse_ui_nodes(backend.dump_ui_xml())
+        reload_item = next(
+            (
+                n
+                for n in nodes
+                if "reload" in n.resource_id
+                or any(k in (n.label or "").lower() for k in ("reload", "recarregar", "atualizar"))
+            ),
+            None,
+        )
+        if reload_item:
+            backend.tap(*reload_item.center)
+            return
+    backend.shell(["am", "start", "-a", "android.intent.action.VIEW", "-p", awc.CHROME_PACKAGE, "-d", url], timeout=10)
+
+
+CHROME_TOOLBAR_IGNORES = (
+    "home",
+    "início",
+    "inicio",
+    "more options",
+    "mais opções",
+    "mais opcoes",
+    "switch or close tabs",
+    "trocar ou fechar separadores",
+    "alternar ou fechar guias",
+    "share",
+    "partilhar",
+    "compartilhar",
+    "bookmark",
+    "favorito",
+    "voice search",
+    "pesquisa por voz",
+    "nova guia",
+    "new tab",
+    "novo separador",
+)
+
+
+def _is_chrome_page_ready(nodes: Sequence[awc.UINode], host: str = "") -> bool:
+    """Verifica se o Chrome concluiu o carregamento (sem progress_bar/stop_loading e com view/conteúdo ativo)."""
+    if not nodes:
+        return False
+    has_progress = any(
+        "progress" in n.resource_id.lower()
+        or "progressbar" in n.class_name.lower()
+        or any(
+            k in (n.label or "").lower()
+            for k in ("stop page loading", "parar carregamento", "interromper carregamento")
+        )
+        for n in nodes
+    )
+    if has_progress:
+        return False
+
+    non_bar_texts = [
+        n.label
+        for n in nodes
+        if n.label
+        and "url_bar" not in n.resource_id
+        and "search_box" not in n.resource_id
+        and "tab_switcher" not in n.resource_id
+        and "menu_button" not in n.resource_id
+        and "home_button" not in n.resource_id
+        and n.label.strip().lower() not in CHROME_TOOLBAR_IGNORES
+    ]
+    joined = " ".join(non_bar_texts).lower()
+    if any(h in joined for h in SECURITY_ERROR_HINTS):
+        return True
+    if any(kw in joined for kw in awc.BLOCK_KEYWORDS) or any(kw in joined for kw in awc.ERROR_KEYWORDS):
+        return True
+    if len(non_bar_texts) >= 1:
+        return True
+
+    # Mesmo quando o WebView do Chrome não expõe nós de texto HTML ao uiautomator,
+    # a ausência de barra de progresso com WebView/compositor/url_bar presente indica carregamento concluído
+    has_chrome_surface = any(
+        "webview" in n.class_name.lower()
+        or any(
+            rid in n.resource_id.lower()
+            for rid in ("compositor_view_holder", "content", "url_bar", "coordinator")
+        )
+        for n in nodes
+    )
+    return has_chrome_surface
+
+
+def _is_png_mostly_blank(png_path: Path) -> bool:
+    """Verifica via Pillow se a imagem capturada está praticamente toda em branco/preto."""
+    if not awc.HAS_PILLOW or not png_path.is_file():
+        return False
+    try:
+        with awc.Image.open(png_path) as img:
+            rgb = img.convert("RGB")
+            w, h = rgb.size
+            crop = rgb.crop((0, int(h * 0.18), w, int(h * 0.90)))
+            extrema = crop.getextrema()
+            return all((hi - lo) < 8 for lo, hi in extrema)
+    except Exception:
+        return False
 
 
 def navigate_chrome_urls_kobiton(
@@ -2244,42 +2912,145 @@ def navigate_chrome_urls_kobiton(
             is_sec_error = False
 
             elapsed = 0
-            for checkpoint in wait_schedule:
+            safe_host = re.sub(r"[^a-zA-Z0-9.-]+", "_", url.replace("https://", "").replace("http://", ""))[:50]
+            png_path = output_dir / "screenshots" / f"chrome_{idx:02d}_{safe_host}.png"
+            has_png = False
+            for cp_idx, checkpoint in enumerate(wait_schedule):
                 delta = max(0, checkpoint - elapsed)
                 if delta > 0:
                     time.sleep(delta)
                 elapsed = checkpoint
                 label = f"{checkpoint}s" if checkpoint < 60 else f"{checkpoint // 60}m"
+                is_last_cp = cp_idx == (len(wait_schedule) - 1)
 
                 xml = backend.dump_ui_xml()
                 nodes = awc.parse_ui_nodes(xml)
-                ui_status, matched_kw, snippet = awc.classify_chrome_screen_text(nodes)
+                ui_status, matched_kw, snippet = _classify_kobiton_screen_text(nodes)
                 lower_snip = snippet.lower()
                 is_sec_error = any(h in lower_snip for h in SECURITY_ERROR_HINTS)
+                ui_ready = is_sec_error or ui_status in ("BLOCKED", "ERROR") or _is_chrome_page_ready(nodes, host)
 
-                if probe.status == "UNKNOWN":
-                    probe = awc.probe_endpoint_connectivity(url)
-
-                if probe.status == "BLOCKED" or ui_status == "BLOCKED":
+                if ui_status == "BLOCKED":
                     detected_status = "BLOCKED"
-                    matched_kw = list(dict.fromkeys(matched_kw + probe.matched_keywords))
                 elif is_sec_error or ui_status == "ERROR":
                     detected_status = "ERROR"
                     if is_sec_error and "security_error" not in matched_kw:
                         matched_kw.append("security_error")
-                elif probe.status == "LOADED" or (ui_status == "ALLOWED" and len(nodes) > 5):
+                elif ui_ready:
                     detected_status = "ALLOWED"
                 else:
                     detected_status = "UNKNOWN"
 
-                if detected_status != "UNKNOWN":
+                # Assim que a página ficar pronta (ui_ready=True e não estiver em branco), prossegue imediatamente
+                if ui_ready or is_last_cp:
+                    has_png = backend.screencap(png_path)
+                    if has_png and _is_png_mostly_blank(png_path) and not is_last_cp:
+                        log.info("Viewport ainda em branco para %s no marco %s; aguardando próximo marco...", url, label)
+                        continue
                     break
-                log.info("Site %s ainda UNKNOWN no marco %s; aguardando próximo marco...", url, label)
+                log.info(
+                    "Site %s aguardando carregamento completo no marco %s (status=%s, ui_ready=%s)...",
+                    url,
+                    label,
+                    detected_status,
+                    ui_ready,
+                )
 
-            safe_host = re.sub(r"[^a-zA-Z0-9.-]+", "_", url.replace("https://", "").replace("http://", ""))[:50]
-            png_path = output_dir / "screenshots" / f"chrome_{idx:02d}_{safe_host}.png"
-            has_png = backend.screencap(png_path)
-            if has_png and add_banner:
+            if not has_png:
+                has_png = backend.screencap(png_path)
+            if has_png and _is_png_mostly_blank(png_path):
+                log.info("Screenshot em branco detectado para %s; aguardando 3s e recapturando...", url)
+                time.sleep(3.0)
+                has_png = backend.screencap(png_path)
+
+            extra_notes = ""
+            # Se houver erro de certificado/segurança, tira o print do erro e do certificado no browser,
+            # clica para abrir a página, aguarda o carregamento e tira um novo print confirmando o bloqueio.
+            if is_sec_error:
+                cert_png_path = output_dir / "screenshots" / f"chrome_{idx:02d}_{safe_host}_01_cert_error.png"
+                cert_details_png = output_dir / "screenshots" / f"chrome_{idx:02d}_{safe_host}_02_sinkhole_cert.png"
+                if has_png and png_path.is_file():
+                    cert_png_path.write_bytes(png_path.read_bytes())
+
+                if _proceed_past_chrome_cert_warning(backend, log, cert_details_png=cert_details_png):
+                    # Aguarda o carregamento completo da página após avançar pelo erro de certificado
+                    for _ in range(10):
+                        time.sleep(2.0)
+                        xml_after = backend.dump_ui_xml()
+                        if xml_after:
+                            xml = xml_after
+                        nodes_after = awc.parse_ui_nodes(xml)
+                        if _is_chrome_page_ready(nodes_after, host):
+                            break
+                    nodes_after = awc.parse_ui_nodes(xml)
+                    ui_status_after, kw_after, snippet_after = _classify_kobiton_screen_text(nodes_after)
+                    if ui_status_after != "BLOCKED":
+                        log.info("Atualizando lookup DNS e recarregando página de bloqueio para %s...", url)
+                        time.sleep(3.0)
+                        _reload_chrome_page(backend, url, host, log)
+                        for _ in range(6):
+                            time.sleep(2.0)
+                            xml_reload = backend.dump_ui_xml()
+                            if xml_reload:
+                                xml = xml_reload
+                            nodes_after = awc.parse_ui_nodes(xml)
+                            if _is_chrome_page_ready(nodes_after, host):
+                                break
+                        ui_status_after, kw_after, snippet_after = _classify_kobiton_screen_text(nodes_after)
+                    if snippet_after:
+                        snippet = snippet_after
+                    if kw_after:
+                        matched_kw = list(dict.fromkeys(matched_kw + kw_after))
+                    if ui_status_after == "BLOCKED":
+                        detected_status = "BLOCKED"
+                    elif ui_status_after == "ALLOWED":
+                        detected_status = "ALLOWED"
+
+            # Sonda o endpoint no dispositivo APÓS a navegação no Chrome para não consumir o evento de bloqueio antes do browser
+            probe = awc.probe_endpoint_connectivity(url)
+            if probe.error:
+                extra_notes = probe.error
+            if probe.status == "BLOCKED":
+                detected_status = "BLOCKED"
+                matched_kw = list(dict.fromkeys(matched_kw + probe.matched_keywords))
+            elif detected_status == "UNKNOWN" and probe.status == "LOADED":
+                detected_status = "ALLOWED"
+
+            if is_sec_error:
+                after_png_path = output_dir / "screenshots" / f"chrome_{idx:02d}_{safe_host}_02_after_cert_proceed.png"
+                has_after_png = backend.screencap(after_png_path)
+                # Tenta capturar o Visualizador de Certificados do Chrome após carregar a página
+                _capture_chrome_certificate_viewer_screenshot(backend, cert_details_png, log)
+
+                if add_banner and cert_png_path.is_file():
+                    awc.annotate_screenshot_with_banner(
+                        cert_png_path,
+                        title=f"{url} (Cert Warning)",
+                        subtitle=f"Chrome Android | IPs: {', '.join(probe.resolved_ips) or '-'} | Keywords: {', '.join(matched_kw) or 'none'}",
+                        status=detected_status,
+                        bypass_risk=private_dns.bypass_risk,
+                    )
+                if add_banner and cert_details_png.is_file():
+                    awc.annotate_screenshot_with_banner(
+                        cert_details_png,
+                        title=f"{url} (Sinkhole Certificate)",
+                        subtitle=f"Chrome Android | IPs: {', '.join(probe.resolved_ips) or '-'} | Keywords: {', '.join(matched_kw) or 'none'}",
+                        status=detected_status,
+                        bypass_risk=private_dns.bypass_risk,
+                    )
+                if has_after_png and add_banner:
+                    awc.annotate_screenshot_with_banner(
+                        after_png_path,
+                        title=f"{url} (After Cert Proceed)",
+                        subtitle=f"Chrome Android | IPs: {', '.join(probe.resolved_ips) or '-'} | Keywords: {', '.join(matched_kw) or 'none'}",
+                        status=detected_status,
+                        bypass_risk=private_dns.bypass_risk,
+                    )
+                if has_after_png:
+                    png_path = after_png_path
+                    has_png = True
+                    extra_notes = f"{extra_notes}; cert_error_png={cert_png_path.name}; cert_details_png={cert_details_png.name}".strip("; ")
+            elif has_png and add_banner:
                 awc.annotate_screenshot_with_banner(
                     png_path,
                     title=url,
@@ -2287,45 +3058,6 @@ def navigate_chrome_urls_kobiton(
                     status=detected_status,
                     bypass_risk=private_dns.bypass_risk,
                 )
-
-            extra_notes = probe.error or ""
-            # Se houver erro de certificado/segurança, tira o print do erro, clica para abrir a página,
-            # aguarda o carregamento e tira um novo print confirmando a página de bloqueio apresentada.
-            if is_sec_error:
-                cert_png_path = output_dir / "screenshots" / f"chrome_{idx:02d}_{safe_host}_01_cert_error.png"
-                if has_png and png_path.is_file():
-                    cert_png_path.write_bytes(png_path.read_bytes())
-
-                if _proceed_past_chrome_cert_warning(backend, log):
-                    time.sleep(max(4, min(page_wait, 8)))
-                    xml_after = backend.dump_ui_xml()
-                    if xml_after:
-                        xml = xml_after
-                    nodes_after = awc.parse_ui_nodes(xml)
-                    ui_status_after, kw_after, snippet_after = awc.classify_chrome_screen_text(nodes_after)
-                    if snippet_after:
-                        snippet = snippet_after
-                    if kw_after:
-                        matched_kw = list(dict.fromkeys(matched_kw + kw_after))
-                    if ui_status_after == "BLOCKED" or probe.status == "BLOCKED":
-                        detected_status = "BLOCKED"
-                    elif ui_status_after == "ALLOWED":
-                        detected_status = "ALLOWED"
-
-                    after_png_path = output_dir / "screenshots" / f"chrome_{idx:02d}_{safe_host}_02_after_cert_proceed.png"
-                    has_after_png = backend.screencap(after_png_path)
-                    if has_after_png and add_banner:
-                        awc.annotate_screenshot_with_banner(
-                            after_png_path,
-                            title=f"{url} (After Cert Proceed)",
-                            subtitle=f"Chrome Android | IPs: {', '.join(probe.resolved_ips) or '-'} | Keywords: {', '.join(matched_kw) or 'none'}",
-                            status=detected_status,
-                            bypass_risk=private_dns.bypass_risk,
-                        )
-                    if has_after_png:
-                        png_path = after_png_path
-                        has_png = True
-                        extra_notes = f"{extra_notes}; cert_error_png={cert_png_path.name}".strip("; ")
 
             if xml:
                 dump_path = output_dir / "ui_dumps" / f"chrome_{idx:02d}_{safe_host}.xml"
@@ -2361,15 +3093,103 @@ def navigate_chrome_urls_kobiton(
                 )
             )
     finally:
-        # Garante que nenhuma aba/página permaneça aberta no navegador ao encerrar
-        backend.shell(["am", "force-stop", awc.CHROME_PACKAGE], timeout=6)
-        log.info("Navegador Chrome encerrado ao término dos testes.")
+        # Fecha todas as abas abertas e encerra o navegador Chrome ao término dos testes
+        _close_all_chrome_tabs(backend, log)
     return results
 
 
 # ==============================================================================
 # RELATÓRIO CONSOLIDADO
 # ==============================================================================
+
+
+def generate_waterfall_html(
+    output_dir: Path,
+    waterfalls: Sequence[WaterfallEntry],
+    cellular_telemetry: Optional[CellularApnTelemetry] = None,
+    private_dns: Optional[awc.PrivateDNSStatus] = None,
+) -> Path:
+    """Gera `waterfall.html` com timeline estilo DevTools (Inspecionar Elemento) dos requests, DNS, HTTP e TLS."""
+    html_path = output_dir / "waterfall.html"
+    rows_html: List[str] = []
+    for wf in waterfalls:
+        max_total = max([wf.total_load_ms, 1] + [r.start_offset_ms + r.duration_ms for r in wf.network_requests])
+        cert_txt = "-"
+        if wf.tls_certificate:
+            cert_txt = (
+                f"Subject: {wf.tls_certificate.subject or '-'} | "
+                f"Issuer: {wf.tls_certificate.issuer or '-'} | "
+                f"Expires: {wf.tls_certificate.not_after or '-'}"
+            )
+        reqs = wf.network_requests or [
+            NetworkRequestItem(
+                url=wf.target,
+                resource_type="document",
+                status_code=wf.http_status,
+                size_bytes=wf.content_bytes,
+                dns_ms=wf.dns_rtt_ms,
+                tcp_ms=wf.tcp_rtt_ms,
+                tls_ms=wf.tls_rtt_ms,
+                ttfb_ms=wf.ttfb_ms,
+                duration_ms=wf.total_load_ms,
+                remote_ip=", ".join(wf.resolved_ips),
+            )
+        ]
+        req_rows: List[str] = []
+        for req in reqs:
+            left_pct = min(95.0, (req.start_offset_ms / max_total) * 100.0)
+            dur = max(req.duration_ms, (req.dns_ms or 0) + (req.tcp_ms or 0) + (req.tls_ms or 0) + (req.ttfb_ms or 0), 1)
+            width_pct = max(2.0, min(100.0 - left_pct, (dur / max_total) * 100.0))
+            req_rows.append(
+                f"<tr>"
+                f"<td class='url'>{html.escape(req.url)}</td>"
+                f"<td>{html.escape(req.resource_type)}</td>"
+                f"<td>{req.status_code or '-'}</td>"
+                f"<td>{req.size_bytes} B</td>"
+                f"<td>{req.dns_ms if req.dns_ms is not None else '-'} ms</td>"
+                f"<td>{req.tcp_ms if req.tcp_ms is not None else '-'} ms</td>"
+                f"<td>{req.tls_ms if req.tls_ms is not None else '-'} ms</td>"
+                f"<td>{req.ttfb_ms if req.ttfb_ms is not None else '-'} ms</td>"
+                f"<td>{dur} ms</td>"
+                f"<td class='tl'><div class='bar-wrap'><div class='bar' style='left:{left_pct:.1f}%;width:{width_pct:.1f}%'></div></div></td>"
+                f"</tr>"
+            )
+        rows_html.append(
+            f"<section class='card'>"
+            f"<h3>{html.escape(wf.target)} <span class='badge {html.escape(wf.status)}'>{html.escape(wf.status)}</span></h3>"
+            f"<p class='meta'><b>DNS Browser/Android:</b> {html.escape(', '.join(wf.dns_server_used) or '-')} | "
+            f"<b>Resolução:</b> {html.escape(', '.join(wf.resolved_ips) or '-')} ({wf.dns_rtt_ms or '-'} ms) | "
+            f"<b>HTTP:</b> {wf.http_status or '-'} | <b>Ping RTT:</b> {wf.device_ping_rtt_ms or '-'} ms</p>"
+            f"<p class='meta'><b>Certificado TLS:</b> {html.escape(cert_txt)}</p>"
+            f"<table><thead><tr><th>Request</th><th>Tipo</th><th>HTTP</th><th>Size</th><th>DNS</th><th>TCP</th><th>TLS</th><th>TTFB</th><th>Total</th><th>Timeline</th></tr></thead>"
+            f"<tbody>{''.join(req_rows)}</tbody></table>"
+            f"</section>"
+        )
+
+    apn_info = html.escape(cellular_telemetry.raw_summary if cellular_telemetry else "-")
+    pdns_info = (
+        f"Android={private_dns.android_mode} | Chrome={private_dns.chrome_secure_dns_state}"
+        if private_dns
+        else "-"
+    )
+    doc = (
+        "<!doctype html><html lang='pt'><head><meta charset='utf-8'>"
+        "<title>Kobiton Network Waterfall</title>"
+        "<style>body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;margin:24px}"
+        ".card{background:#1e293b;border-radius:10px;padding:16px;margin-bottom:18px}"
+        ".meta{font-size:13px;color:#cbd5e1;margin:4px 0}.badge{padding:2px 8px;border-radius:6px;font-size:12px}"
+        ".BLOCKED{background:#dc2626}.LOADED,.ALLOWED{background:#16a34a}.UNKNOWN,.ERROR{background:#d97706}"
+        "table{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px}"
+        "th,td{border-bottom:1px solid #334155;padding:6px;text-align:left}"
+        ".url{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+        ".tl{width:220px}.bar-wrap{position:relative;height:12px;background:#0f172a;border-radius:4px}"
+        ".bar{position:absolute;top:2px;height:8px;background:#38bdf8;border-radius:3px}</style></head><body>"
+        f"<h1>Network Waterfall — Kobiton Android</h1>"
+        f"<p class='meta'><b>Telemetria APN:</b> {apn_info} | <b>Private DNS:</b> {html.escape(pdns_info)}</p>"
+        f"{''.join(rows_html)}</body></html>"
+    )
+    html_path.write_text(doc, encoding="utf-8")
+    return html_path
 
 
 def write_kobiton_reports(
@@ -2728,25 +3548,32 @@ def _run_device_session(
     orig_probe = awc.probe_endpoint_connectivity
 
     def _kobiton_probe(url: str, timeout: int = 10) -> awc.EndpointProbeResult:
+        active_dns = private_dns.active_dns_servers or cellular_telemetry.dns_addresses
         probe, wf = measure_url_waterfall(
             url,
             dns_servers=dns_servers,
             block_ips=block_ips,
             backend=backend,
             timeout=timeout,
+            active_dns_servers=active_dns,
+            output_dir=output_dir,
         )
         waterfalls.append(wf)
+        cert_summary = ""
+        if wf.tls_certificate:
+            cert_summary = (
+                f" | TLS_Cert(subject={wf.tls_certificate.subject or '-'}, "
+                f"issuer={wf.tls_certificate.issuer or '-'}, "
+                f"verify={wf.tls_certificate.verify_result or '-'})"
+            )
         log.info(
-            "Waterfall %s -> %s (dns_rtt=%sms tcp_rtt=%sms tls_rtt=%sms ttfb=%sms ping_rtt=%sms total=%sms ips=%s)",
+            "Probe %s -> %s (http=%s, ips=%s, ping_rtt=%sms%s)",
             url,
             wf.status,
-            wf.dns_rtt_ms,
-            wf.tcp_rtt_ms,
-            wf.tls_rtt_ms,
-            wf.ttfb_ms,
-            wf.device_ping_rtt_ms,
-            wf.total_load_ms,
+            wf.http_status,
             wf.resolved_ips,
+            wf.device_ping_rtt_ms,
+            cert_summary,
         )
         return probe
 
@@ -2799,9 +3626,13 @@ def _run_device_session(
 
         # 3b. Confirmar que o SIM registrou na APN (aguardando 5s, 15s, 45s, 2m, 5m se necessário)
         if not args.skip_apn_check:
-            cellular_telemetry = wait_for_sim1_apn_registration(backend, wifi_mgr, output_dir, log)
+            cellular_telemetry = wait_for_sim1_apn_registration(
+                backend, wifi_mgr, output_dir, log, expected_dns_servers=dns_servers
+            )
         else:
-            cellular_telemetry = collect_cellular_apn_telemetry(backend, wifi_mgr, log)
+            cellular_telemetry = collect_cellular_apn_telemetry(
+                backend, wifi_mgr, log, expected_dns_servers=dns_servers
+            )
 
         # 3c. Limpar cache do navegador antes de iniciar os testes
         if not args.skip_clear_cache:
@@ -2809,12 +3640,12 @@ def _run_device_session(
 
         dns_connectivity = test_dns_server_connectivity(backend, dns_servers, output_dir, log)
 
-        # 4. Auditar Private DNS (Android + Chrome)
+        # 4. Auditar Private DNS (Android + Chrome) via settings/dumpsys sem screenshots 00_*
         if cfg.check_private_dns:
             private_dns = awc.check_android_private_dns(
                 backend,
                 output_dir=output_dir,
-                check_ui=not args.skip_private_dns_ui,
+                check_ui=False,
                 logger=log,
             )
 

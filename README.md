@@ -106,3 +106,82 @@ A ferramenta lê automaticamente o arquivo [`.env`](file:///Users/daniel/Develop
 ## Personalizando os IPs padrão dos 3 Use Cases
 
 No arquivo [`.env`](file:///Users/daniel/Developer/DNS-Whalebone-Check/.env) (`USE_CASE_1_DNS`, `USE_CASE_2_DNS`, `USE_CASE_3_DNS`) ou no início de [`dns_whalebone_check.py`](file:///Users/daniel/Developer/DNS-Whalebone-Check/dns_whalebone_check.py#L68-L84), você encontra o dicionário `USE_CASES`, onde pode ajustar os nomes e os IPs pré-configurados de cada um dos 3 cenários.
+
+---
+
+## Automação Android Local (Termux ou ADB): `android_whalebone_check.py`
+
+Para auditoria direta em um aparelho Android (via USB ADB ou nativamente no Termux):
+
+```bash
+cp .env.android.example .env.android
+python3 android_whalebone_check.py
+```
+
+Principais validações executadas:
+- Auditoria de **Private DNS** (Android OS) e **Secure DNS / DoH** (Google Chrome), calculando o risco de bypass.
+- Navegação nos aplicativos configurados (`reddit`, `instagram`, `netflix`, etc.) e nas URLs de teste no Google Chrome.
+- Geração de `report.json`, `report.csv`, `run.log`, `ui_dumps/` e `screenshots/` com banner informativo.
+
+---
+
+## Automação no Kobiton: `kobiton_whalebone_check.py`
+
+O script [`kobiton_whalebone_check.py`](file:///Users/daniel/Developer/DNS-Whalebone-Check/kobiton_whalebone_check.py) executa todas as validações diretamente nos dispositivos Android no **Kobiton** (via Appium W3C WebDriver, sem dependências externas obrigatórias), sem usar a rede ou alterar o DNS do host onde o script é executado.
+
+### 1. Configuração (`.env.kobiton`)
+
+```bash
+cp .env.kobiton.example .env.kobiton
+```
+
+Principais variáveis em [`.env.kobiton.example`](file:///Users/daniel/Developer/DNS-Whalebone-Check/.env.kobiton.example):
+- **`KOBITON_USERNAME` / `KOBITON_API_KEY`**: Credenciais de acesso ao Kobiton.
+- **`KOBITON_UDID` / `KOBITON_UDIDS`**: Um ou mais UDIDs separados por vírgula (ex: `R3CRA0RKYXN,129b5649`).
+- **`KOBITON_TARGET_MSISDN`**: MSISDN (ou ICCID) do SIM que deve ficar ativo durante os testes.
+- **`KOBITON_DNS_SERVERS`**: Servidores DNS destino para teste de conectividade a partir do dispositivo (ex: `10.36.41.115`).
+- **`KOBITON_BLOCK_IPS`**: IPs de resposta DNS que confirmam bloqueio Whalebone/NOS (padrão: `212.113.177.247`).
+- **`KOBITON_DISABLE_WIFI_DURING_TESTS`**: Desativa o Wi-Fi no Android durante os testes para forçar uso da rede móvel e restaura ao final (padrão: `true`).
+
+### 2. Listar dispositivos e MSISDNs disponíveis no Kobiton
+
+```bash
+# Lista rápida via API REST do Kobiton
+python3 kobiton_whalebone_check.py --list-devices
+
+# (Opcional) Consulta os MSISDNs diretamente nos dispositivos online e livres
+python3 kobiton_whalebone_check.py --list-devices --probe-msisdn
+```
+
+### 3. Executar os testes no Kobiton
+
+```bash
+# Usando as configurações de .env.kobiton
+python3 kobiton_whalebone_check.py
+
+# Ou informando dispositivos e DNS via linha de comando
+python3 kobiton_whalebone_check.py --udids R3CRA0RKYXN 129b5649 --dns-servers 10.36.41.115 --target-msisdn +351930992785
+```
+
+### Fluxo executado em cada dispositivo
+1. **Wi-Fi**: detecta o estado inicial e desativa o Wi-Fi no Android durante os testes (restaurado ao final).
+2. **Dual SIM & MSISDN**: lê o estado inicial de `SIM1` e `SIM2`, identifica os MSISDNs (via `dumpsys`, `siminfo`, `iphonesubinfo` e UI do Gestor SIM, descartando valores mascarados como `+3519[****`), ativa o SIM alvo e desativa o outro.
+3. **Ciclo de Modo Avião**: ativa por `4s` e desativa aguardando `10s` para forçar o deregistro e novo registro do SIM na rede móvel.
+4. **Confirmação de APN + Internet**: verifica nos marcos `5s, 15s, 45s, 2m, 5m` se o SIM registrou na APN (com IPv4/IPv6 e DNS) e navega na internet. Se não registrar em até `5m`, aborta, restaura o estado original e reporta o erro.
+5. **Telemetria móvel & Limpeza de cache**: coleta operadora, MCC/MNC, tipo de rede, roaming, APN, interface, IPv4, IPv6 e DNS recebidos da APN; limpa o cache do Chrome e testa a conectividade do DNS destino a partir do dispositivo.
+6. **Private DNS, Apps e Chrome**:
+   - Dispensa diálogos modais (ex.: *"Desbloqueie as suas palavras-passe... Agora não"* no Netflix).
+   - Para cada URL no Chrome, aguarda até `2m` nos marcos `5s, 15s, 30s, 1m, 2m`.
+   - Em erros de certificado/segurança, tira o print do erro, clica em **Avançadas -> Avançar para o site**, aguarda o carregamento e tira um novo print confirmando a página de bloqueio.
+   - Fecha cada aba aberta e encerra o Chrome ao final.
+7. **Restauração e Evidências**: no bloco `finally` (mesmo em `KeyboardInterrupt` ou erro), restaura SIM1/SIM2, Modo Avião, DNS e Wi-Fi ao estado original, encerra a sessão no Kobiton, organiza os prints em `screenshots/<MSISDN>/` e gera `report.json` (incluindo `telemetry.cellular_apn` e `telemetry.waterfalls`) e `report.csv`.
+
+---
+
+## Testes Unitários
+
+Para executar a suíte de testes unitários localmente:
+
+```bash
+python3 -m unittest tests/test_kobiton_whalebone_check.py tests/test_android_whalebone_check.py -v
+```
